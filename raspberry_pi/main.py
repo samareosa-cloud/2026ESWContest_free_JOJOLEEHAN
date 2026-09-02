@@ -146,9 +146,7 @@ def calculate_color_score(hsv_roi, mask, total_pixels):
 
 
 #메인 코드
-print("모델 로딩 중...")
 model = YOLO('best_ncnn_model', task='detect') 
-print("로딩 완료!")
 
 esp_serial = None
 if HAS_SERIAL:
@@ -168,19 +166,19 @@ if HAS_PICAM2:
         config = picam2.create_video_configuration(main={"size": (640, 480), "format": "bgr888"})
         picam2.configure(config)
         picam2.start()
-        print("라즈베리파이 카메라 모듈 3 기능 on")
+        print("라즈베리파이 카메라 모듈 3 초기화 완료")
     except Exception as e:
-        print(f"카메라 모듈 on 실패: {e}")
+        print(f"카메라 모듈 초기화 실패: {e}")
         exit()
 else:
     exit()
 
 print("--------------------------------------------------------------------------------")
-print("통합 AI 시작")
+print("시작")
 print("--------------------------------------------------------------------------------")
 
 # 상태 제어 글로벌 변수
-event = "NORMAL"
+event = "CROSSWALK:0"
 last_sent_event = ""
 
 # 신호등 히스테리시스 변수
@@ -298,7 +296,7 @@ try:
         r_score, g_score = 0.0, 0.0
         r_detail, g_detail = "", ""
         
-        if event in ["CROSSWALK_AHEAD", "WAIT_SIGNAL"]:
+        if event in ["CROSSWALK:1", "WAIT_SIGNAL"]:
             if largest_tl_box is not None: selected_light = largest_tl_box
             elif largest_gl_box is not None: selected_light = largest_gl_box
             
@@ -328,7 +326,7 @@ try:
 
         # 신호등 색상 스택 관련 코드
         if selected_light is None:
-            if event in ["CROSSWALK_AHEAD", "WAIT_SIGNAL"]:
+            if event in ["CROSSWALK:1", "WAIT_SIGNAL"]:
                 tl_missing_frames += 1
                 if tl_missing_frames >= 20:
                     stable_color = "Unknown"
@@ -354,21 +352,21 @@ try:
                             candidate_frames = 0
 
         #4단계 상태머신 업데이트
-        if event == "NORMAL":
+        if event == "CROSSWALK:0":
             if is_cw_straight_and_close:
                 cw_straight_frames += 1
                 if cw_straight_frames >= 10:
-                    event = "CROSSWALK_AHEAD"
+                    event = "CROSSWALK:1"
                     red_frames, green_frames, missing_cw_frames = 0, 0, 0
                     has_seen_red = False 
             else:
                 cw_straight_frames = max(0, cw_straight_frames - 1)
 
-        elif event in ["CROSSWALK_AHEAD", "WAIT_SIGNAL"]:
+        elif event in ["CROSSWALK:1", "WAIT_SIGNAL"]:
             if largest_cw_box is None:
                 missing_cw_frames += 1
                 if missing_cw_frames >= 20:
-                    event = "NORMAL"
+                    event = "CROSSWALK:0"
                     cw_straight_frames = 0 
             else:
                 missing_cw_frames = 0 
@@ -390,19 +388,20 @@ try:
                         else:
                             event = "WAIT_SIGNAL"
 
-        elif event in ["STRAIGHT", "LEFT_CORRECTION", "RIGHT_CORRECTION"]:
+        elif event in ["CROSS_MOTOR:CENTER", "CROSS_MOTOR:L", "CROSS_MOTOR:R"]:
             if largest_cw_box is None:
                 missing_cw_frames += 1
                 if missing_cw_frames >= 20: 
                     event = "CROSSING_END"
             else:
                 missing_cw_frames = 0
-                if cw_direction == "Turn Left": event = "LEFT_CORRECTION"
-                elif cw_direction == "Turn Right": event = "RIGHT_CORRECTION"
-                else: event = "STRAIGHT"
+                if cw_direction == "Turn Left": event = "CROSS_MOTOR:L"
+                elif cw_direction == "Turn Right": event = "CROSS_MOTOR:R"
+                else: event = "CROSS_MOTOR:CENTER"
 
         # ESP32 데이터 전송
-        # (WAIT_SIGNAL은 내부/화면 표시용)
+        # WAIT_SIGNAL은 Raspberry Pi 내부 상태로만 사용하고,
+        # ESP32에는 실제 신호등 색을 전송한다.
 
         if event == "WAIT_SIGNAL":
 
@@ -419,105 +418,86 @@ try:
                 event_key = "WAIT_SIGNAL:NONE"
 
             if event_key != last_sent_event:
-
                 print(f"현재 상태: {event}")
 
                 if esp_serial is not None:
                     try:
                         data_to_send = f"{send_event}\n"
-                        esp_serial.write(
-                            data_to_send.encode("utf-8")
-                        )
+                        esp_serial.write(data_to_send.encode("utf-8"))
 
                         print(
-                            f"ESP32 데이터 전송 완료: {send_event}"
+                            f" ESP32 데이터 전송 완료: {send_event}"
                         )
 
                     except Exception as e:
                         print(
-                            f"ESP32 데이터 전송 실패: {e}"
+                            f" ESP32 데이터 전송 실패: {e}"
                         )
-
                 else:
                     print("ESP32 미연결. 시리얼 전송 생략")
 
                 last_sent_event = event_key
 
 
-        # 초록불 확인 후 횡단 시작
         elif event == "CROSSING_START":
 
             if event != last_sent_event:
-
                 print(f"현재 상태: {event}")
 
                 if esp_serial is not None:
                     try:
-                        # 1. 초록불 먼저 전달
-                        esp_serial.write(
-                            b"LIGHT:GREEN\n"
-                        )
-
+                        # 초록불 먼저 전송
+                        esp_serial.write(b"LIGHT:GREEN\n")
                         print(
-                            "ESP32 데이터 전송 완료: LIGHT:GREEN"
+                            " ESP32 데이터 전송 완료: LIGHT:GREEN"
                         )
 
-                        # 전송 순서가 확실하게 구분되도록 아주 짧은 딜레이
                         time.sleep(0.05)
 
-                        # 2. 그 다음 횡단 시작 전달
-                        esp_serial.write(
-                            b"CROSSING_START\n"
-                        )
-
+                        # 그 다음 횡단 시작
+                        esp_serial.write(b"CROSSING_START\n")
                         print(
-                            "ESP32 데이터 전송 완료: CROSSING_START"
+                            " ESP32 데이터 전송 완료: CROSSING_START"
                         )
 
                     except Exception as e:
                         print(
-                            f"ESP32 데이터 전송 실패: {e}"
+                            f" ESP32 데이터 전송 실패: {e}"
                         )
-
                 else:
                     print("ESP32 미연결. 시리얼 전송 생략")
 
                 last_sent_event = event
 
 
-        # 나머지 event
         else:
 
             if event != last_sent_event:
-
                 print(f"현재 상태: {event}")
 
                 if esp_serial is not None:
                     try:
                         data_to_send = f"{event}\n"
-
-                        esp_serial.write(
-                            data_to_send.encode("utf-8")
-                        )
+                        esp_serial.write(data_to_send.encode("utf-8"))
 
                         print(
-                            f"ESP32 데이터 전송 완료: {event}"
+                            f" ESP32 데이터 전송 완료: {event}"
                         )
 
                     except Exception as e:
                         print(
-                            f"ESP32 데이터 전송 실패: {e}"
+                            f" ESP32 데이터 전송 실패: {e}"
                         )
-
                 else:
                     print("ESP32 미연결. 시리얼 전송 생략")
 
                 last_sent_event = event
 
+
                 
         # CROSSING_START/END 는 1틱용 플래그이므로 바로 전환
-        if event == "CROSSING_START": event = "STRAIGHT" 
-        elif event == "CROSSING_END": event = "NORMAL"   
+        if event == "CROSSING_START": event = "CROSS_MOTOR:CENTER" 
+        elif event == "CROSSING_END": event = "CROSSWALK:0"   
 
         # 5단계 디버깅용 화면 출력
         for det in all_detections:
