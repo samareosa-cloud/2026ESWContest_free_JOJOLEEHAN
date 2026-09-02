@@ -559,23 +559,6 @@ CROSS_MOTOR:R
 CROSS_MOTOR:CENTER
 ```
 
----
-
-## 📱 Flutter App Execution
-
-TMAP API Key는 Repository에 직접 저장하지 않습니다.
-
-Flutter 실행 시 다음과 같이 App Key를 전달합니다.
-
-```bash
-flutter pub get
-flutter run --dart-define=TMAP_APP_KEY=YOUR_TMAP_APP_KEY
-```
-
-> ⚠️ 실제 TMAP API Key를 Public Repository에 업로드하지 마세요.
-
----
-
 ## 🍓 Raspberry Pi Execution
 
 Main file:
