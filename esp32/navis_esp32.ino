@@ -86,8 +86,8 @@ bool obstacleTriggered = false;
 // 방향 유도 모터 설정
 // =====================================================
 
-const int GUIDE_PWM = 40;
-const int GUIDE_TIME = 200;
+const int GUIDE_PWM = 55;
+const int GUIDE_TIME = 250;
 
 
 // =====================================================
@@ -110,6 +110,7 @@ const int BRAKE_COUNT = 3;
 // =====================================================
 
 bool crosswalkMode = false;
+bool trafficRed = false;
 
 
 // =====================================================
@@ -334,6 +335,82 @@ void guideForward() {
   );
 }
 
+// =====================================================
+// 횡단보도 LEFT 보정
+// Raspberry Pi -> CROSS_MOTOR:L
+// =====================================================
+void crosswalkLeft() {
+
+  if (
+    !crosswalkMode ||
+    trafficRed ||
+    obstacleTriggered
+  ) {
+    stopMotors();
+    return;
+  }
+
+  Serial.println("[CROSS MOTOR] LEFT");
+
+  // M1 정지
+  ledcWrite(M1_PWM, 0);
+
+  // M2를 이용해 왼쪽 유도
+  digitalWrite(M2_DIR, LOW);
+  ledcWrite(M2_PWM, GUIDE_PWM);
+
+  delay(GUIDE_TIME);
+
+  ledcWrite(M2_PWM, 0);
+
+  sendBLE("CROSS_MOTOR:L");
+}
+
+
+// =====================================================
+// 횡단보도 RIGHT 보정
+// Raspberry Pi -> CROSS_MOTOR:R
+// =====================================================
+void crosswalkRight() {
+
+  if (
+    !crosswalkMode ||
+    trafficRed ||
+    obstacleTriggered
+  ) {
+    stopMotors();
+    return;
+  }
+
+  Serial.println("[CROSS MOTOR] RIGHT");
+
+  // M2 정지
+  ledcWrite(M2_PWM, 0);
+
+  // M1을 이용해 오른쪽 유도
+  digitalWrite(M1_DIR, LOW);
+  ledcWrite(M1_PWM, GUIDE_PWM);
+
+  delay(GUIDE_TIME);
+
+  ledcWrite(M1_PWM, 0);
+
+  sendBLE("CROSS_MOTOR:R");
+}
+
+
+// =====================================================
+// 횡단보도 중앙 유지
+// Raspberry Pi -> CROSS_MOTOR:CENTER
+// =====================================================
+void crosswalkCenter() {
+
+  stopMotors();
+
+  Serial.println("[CROSS MOTOR] CENTER");
+
+  sendBLE("CROSS_MOTOR:CENTER");
+}
 
 // =====================================================
 // 장애물 역토크 3회
@@ -614,6 +691,9 @@ void handlePiMessage(
   ) {
 
     crosswalkMode = false;
+    trafficRed = false;
+
+    stopMotors();
 
 
     sendBLE(
@@ -625,10 +705,9 @@ void handlePiMessage(
   }
 
 
-  // -------------------------------------------------
+    // -------------------------------------------------
   // 빨간불
   // -------------------------------------------------
-
   if (
     message == "LIGHT:RED"
     ||
@@ -636,14 +715,13 @@ void handlePiMessage(
   ) {
 
     crosswalkMode = true;
+    trafficRed = true;
 
     stopMotors();
-
 
     sendBLE(
       "LIGHT:RED"
     );
-
 
     return;
   }
@@ -652,7 +730,6 @@ void handlePiMessage(
   // -------------------------------------------------
   // 초록불
   // -------------------------------------------------
-
   if (
     message == "LIGHT:GREEN"
     ||
@@ -660,14 +737,13 @@ void handlePiMessage(
   ) {
 
     crosswalkMode = true;
+    trafficRed = false;
 
     stopMotors();
-
 
     sendBLE(
       "LIGHT:GREEN"
     );
-
 
     return;
   }
@@ -676,7 +752,6 @@ void handlePiMessage(
   // -------------------------------------------------
   // 신호등 인식 안 됨
   // -------------------------------------------------
-
   if (
     message == "LIGHT:NONE"
   ) {
@@ -685,7 +760,6 @@ void handlePiMessage(
       "LIGHT:NONE"
     );
 
-
     return;
   }
 
@@ -693,20 +767,57 @@ void handlePiMessage(
   // -------------------------------------------------
   // 횡단 시작
   // -------------------------------------------------
-
   if (
     message == "CROSSING_START"
   ) {
 
     crosswalkMode = true;
+    trafficRed = false;
 
     stopMotors();
-
 
     sendBLE(
       "CROSSING_START"
     );
 
+    return;
+  }
+
+
+  // -------------------------------------------------
+  // 횡단 중 왼쪽 보정
+  // -------------------------------------------------
+  if (
+    message == "CROSS_MOTOR:L"
+  ) {
+
+    crosswalkLeft();
+
+    return;
+  }
+
+
+  // -------------------------------------------------
+  // 횡단 중 오른쪽 보정
+  // -------------------------------------------------
+  if (
+    message == "CROSS_MOTOR:R"
+  ) {
+
+    crosswalkRight();
+
+    return;
+  }
+
+
+  // -------------------------------------------------
+  // 횡단 중 중앙 유지
+  // -------------------------------------------------
+  if (
+    message == "CROSS_MOTOR:CENTER"
+  ) {
+
+    crosswalkCenter();
 
     return;
   }
@@ -715,20 +826,18 @@ void handlePiMessage(
   // -------------------------------------------------
   // 횡단 종료
   // -------------------------------------------------
-
   if (
     message == "CROSSING_END"
   ) {
 
     crosswalkMode = false;
+    trafficRed = false;
 
     stopMotors();
-
 
     sendBLE(
       "CROSSING_END"
     );
-
 
     return;
   }
