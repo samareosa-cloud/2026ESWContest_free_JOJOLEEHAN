@@ -682,14 +682,12 @@ Navis는 다음 기술을 하나의 시스템으로 통합하는 것을 목표�
 
 ## 🧑‍🤝‍🧑 Team Member
 
-| Team Member | Role |
+| **팀원** | **담당 역할** |
 |---|---|
-| 팀원 1 | AI Vision / Raspberry Pi |
-| 팀원 2 | ESP32 / Motor Control / Sensor |
-| 팀원 3 | Flutter App / Navigation |
-| 팀원 4 | Hardware / Integration / Testing |
-
-> 실제 팀원 이름과 역할에 맞게 수정해주세요.
+| 조혜은 (팀장) | 프로젝트 총괄, ESP32 기반 모터 제어, HW 제작 |
+| 조성원 | Raspberry Pi, YOLO 모델 학습 및 영상처리 |
+| 이소이 | 센서 데이터 처리, Flutter App UI 구현 |
+| 한채원 | 3D 모델링 및 프린팅, HW·회로 제작 |
 
 ---
 
