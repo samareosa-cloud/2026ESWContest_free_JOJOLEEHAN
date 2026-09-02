@@ -168,16 +168,15 @@ if HAS_PICAM2:
         config = picam2.create_video_configuration(main={"size": (640, 480), "format": "bgr888"})
         picam2.configure(config)
         picam2.start()
-        print("라즈베리파이 카메라 모듈 3 초기화 완료!")
+        print("라즈베리파이 카메라 모듈 3 기능 on")
     except Exception as e:
-        print(f"카메라 모듈 초기화 실패: {e}")
+        print(f"카메라 모듈 on 실패: {e}")
         exit()
 else:
     exit()
 
 print("--------------------------------------------------------------------------------")
-print("통합 AI 시작 (라즈베리파이 4 + Picamera2 버전)")
-print("화면 클릭 후 'q'를 누르면 종료됩니다.")
+print("통합 AI 시작")
 print("--------------------------------------------------------------------------------")
 
 # 상태 제어 글로벌 변수
