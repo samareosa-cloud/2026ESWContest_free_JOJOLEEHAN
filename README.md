@@ -49,6 +49,12 @@ Navis는 여기에서 한 단계 더 나아가,
 
 ---
 
+## 🛠 Hardware
+
+<p align="center">
+  <img src="./docs/hardware.png" width="700">
+</p>
+
 ## 📝 Overview
 
 Navis는 크게 **Flutter App, Raspberry Pi, ESP32**의 세 가지 소프트웨어 시스템으로 구성됩니다.
