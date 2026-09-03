@@ -627,7 +627,7 @@ Reverse Torque  : 3 times
 
 NAVIS의 주요 기능 및 실제 동작을 확인할 수 있는 시연 영상입니다.
 
-[![NAVIS Demo Video](https://img.youtube.com/vi/영상ID/maxresdefault.jpg)]([유튜브링크](https://youtu.be/FR7wWThx7Qo?si=4miaAuCFnOR1-boZ))
+[![NAVIS Demo Video](https://youtu.be/FR7wWThx7Qo?si=4miaAuCFnOR1-boZ))
 
 ▶ 이미지를 클릭하면 시연 영상으로 이동합니다.
 
