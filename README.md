@@ -435,19 +435,27 @@ Normal Navigation
 ```text
 Navis/
 │
+├── docs/
+│   └── [images and documentation]
+│
 ├── esp32/
 │   ├── README.md
 │   └── navis_esp32.ino
 │
 ├── raspberry_pi/
+│   ├── best_ncnn_model/
 │   ├── README.md
 │   └── main.py
 │
 ├── flutter_app/
+│   ├── android/
+│   ├── ios/
+│   ├── lib/
+│   │   └── main.dart
 │   ├── README.md
+│   ├── analysis_options.yaml
 │   ├── pubspec.yaml
-│   └── lib/
-│       └── main.dart
+│   └── pubspec.lock
 │
 └── README.md
 ```
