@@ -478,10 +478,11 @@ esp32/
 - 장애물 역토크 경고
 - 횡단보도 조향 제어
 
-### Raspberry Pi
+## Raspberry Pi
 
 ```text
 raspberry_pi/
+├── best_ncnn_model/
 ├── README.md
 └── main.py
 ```
@@ -489,33 +490,47 @@ raspberry_pi/
 주요 기능:
 
 - Camera 입력
-- YOLO 추론
+- YOLO 기반 보행환경 인식
 - 횡단보도 인식
 - 신호등 인식
 - HSV 신호 색상 판단
 - 횡단보도 방향 분석
 - ESP32 UART 통신
 
-### Flutter App
+```markdown
+## Flutter App
 
 ```text
+
 flutter_app/
+
+├── android/
+
+├── ios/
+
+├── lib/
+
+│   └── main.dart
+
 ├── README.md
-├── pubspec.yaml
-└── lib/
-    └── main.dart
+
+├── analysis_options.yaml
+
+├── pubspec.lock
+
+└── pubspec.yaml
 ```
 
 주요 기능:
 
-- TMAP 목적지 검색
-- 보행자 경로 생성
-- GPS 위치 측정
-- Compass 방향 측정
-- 목표 방위각 계산
+- 현재 위치 및 목적지 표시
+- TMAP 기반 보행 경로 탐색
 - 음성 목적지 입력
-- TTS 안내
-- ESP32 BLE 통신
+- TTS 음성 안내
+- ESP32 BLE 연결
+- 좌·우 조향 명령 전송
+- 현재 방향 및 목표 방향 계산
+- 장애물 감지 상태 표시
 - 시스템 상태 UI 표시
 
 ---
