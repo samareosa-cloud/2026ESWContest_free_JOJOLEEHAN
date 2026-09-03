@@ -460,7 +460,7 @@ Navis/
 └── README.md
 ```
 
-### ESP32
+## ESP32
 
 ```text
 esp32/
@@ -497,7 +497,7 @@ raspberry_pi/
 - 횡단보도 방향 분석
 - ESP32 UART 통신
 
-```markdown
+
 ## Flutter App
 
 ```text
