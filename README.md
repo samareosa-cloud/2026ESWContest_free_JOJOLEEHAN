@@ -625,28 +625,11 @@ Reverse Torque  : 3 times
 
 ### Demo Video
 
-> 시연 영상 업로드 후 아래에 YouTube 링크를 추가합니다.
+NAVIS의 주요 기능 및 실제 동작을 확인할 수 있는 시연 영상입니다.
 
-```text
-YouTube Demo Video
-Coming Soon
-```
+[![NAVIS Demo Video](https://img.youtube.com/vi/영상ID/maxresdefault.jpg)]([유튜브링크](https://youtu.be/FR7wWThx7Qo?si=4miaAuCFnOR1-boZ))
 
----
-
-## 📷 Project Images
-
-### Hardware
-
-> 완성된 Navis 장치 사진 추가 예정
-
-### Flutter Application
-
-> Flutter App 실행 화면 추가 예정
-
-### AI Vision
-
-> 횡단보도 / 신호등 YOLO 인식 화면 추가 예정
+▶ 이미지를 클릭하면 시연 영상으로 이동합니다.
 
 ---
 
