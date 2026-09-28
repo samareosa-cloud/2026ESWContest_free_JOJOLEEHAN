@@ -76,9 +76,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   static const String txUuid =
       '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
-  // TFmini: 100cm 이내일 때만 "장애물 감지"를 화면에 표시.
-  // 장애물 TTS는 하지 않는다.
+  // TFmini: 100cm 이내가 되면 화면에 "장애물 감지"를 표시하고
+  // 음성으로 한 번 경고한다.
   static const double obstacleWarningCm = 100.0;
+
+  // 100cm 경계에서 거리값이 흔들릴 때 경고가 반복되지 않도록
+  // 이 거리보다 멀어져야 다시 경고할 수 있다.
+  static const double obstacleWarningResetCm = 120.0;
 
   // ===========================================================================
   // 객체 / 스트림
@@ -108,6 +112,22 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   String _lastRecognizedWords = '';
   String _speechStatus = '음성 시스템 준비 중...';
   String _recognizedDestinationText = '';
+
+  // TTS 대기열.
+  // 모든 음성은 이 대기열을 통해 한 문장씩 순서대로 재생된다.
+  // (여러 곳에서 동시에 _tts.stop() + _tts.speak()를 호출하면
+  //  서로의 음성을 끊거나 플러그인이 새 문장을 무시해서
+  //  장애물/신호등 음성이 나오지 않았다.)
+  Future<void> _ttsQueue = Future<void>.value();
+  int _pendingTtsCount = 0;
+  int _ttsGeneration = 0;
+  Completer<void>? _ttsDone;
+
+  // 같은 종류의 경고가 짧은 시간에 반복되지 않도록 마지막 재생 시각 기록.
+  final Map<String, DateTime> _lastAlertSpokenAt = {};
+
+  // 정면 100cm 경고를 다시 할 수 있는 상태인지.
+  bool _frontWarningArmed = true;
 
   // ===========================================================================
   // 지도 / 경로 / 내비게이션
@@ -156,9 +176,15 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   bool _obstacleConfirmed = false;
 
   // ===========================================================================
-  // TFmini / Raspberry Pi 인식 결과
+  // 거리 센서 / Raspberry Pi 인식 결과
   // ===========================================================================
+  // 정면: TFmini
   double? _distanceCm;
+
+  // 좌/우: VL53L1X
+  double? _leftDistanceCm;
+  double? _rightDistanceCm;
+
   bool _crosswalkDetected = false;
   String _trafficLight = 'NONE'; // RED / GREEN / NONE
 
@@ -188,6 +214,9 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
     _guidanceTimer?.cancel();
     _listenRetryTimer?.cancel();
+
+    _ttsGeneration++;
+    _completeCurrentTts();
 
     _speech.cancel();
     _tts.stop();
@@ -227,11 +256,41 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     await _tts.setSpeechRate(0.45);
     await _tts.setPitch(1.0);
     await _tts.setVolume(1.0);
-    await _tts.awaitSpeakCompletion(true);
+
+    // 재생 완료는 플러그인의 awaitSpeakCompletion 대신
+    // 완료/에러 핸들러로 직접 기다린다.
+    // awaitSpeakCompletion(true)에서는 앞 문장이 끝나기 전에 들어온
+    // speak()가 Android에서 무시되거나, stop()으로 끊긴 speak()의
+    // Future가 끝나지 않아 이후 음성이 막힐 수 있다.
+    await _tts.awaitSpeakCompletion(false);
+
+    _tts.setCompletionHandler(() {
+      _completeCurrentTts();
+    });
+
+    _tts.setErrorHandler((dynamic message) {
+      debugPrint('[TTS ERROR HANDLER] $message');
+      _completeCurrentTts();
+    });
 
     if (Platform.isAndroid) {
       try {
         await _tts.setAudioAttributesForNavigation();
+      } catch (_) {}
+    }
+
+    if (Platform.isIOS) {
+      try {
+        await _tts.setSharedInstance(true);
+        await _tts.setIosAudioCategory(
+          IosTextToSpeechAudioCategory.playAndRecord,
+          [
+            IosTextToSpeechAudioCategoryOptions.defaultToSpeaker,
+            IosTextToSpeechAudioCategoryOptions.allowBluetooth,
+            IosTextToSpeechAudioCategoryOptions.allowBluetoothA2DP,
+          ],
+          IosTextToSpeechAudioMode.voicePrompt,
+        );
       } catch (_) {}
     }
   }
@@ -317,37 +376,158 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     });
   }
 
-  Future<void> _speak(String text) async {
-    if (text.trim().isEmpty) return;
+  /// 문장을 TTS 대기열에 넣는다.
+  ///
+  /// 반환된 Future는 이 문장의 재생이 끝나면 완료된다.
+  /// [interrupt]가 true이면 지금 재생 중인 문장과 대기 중인 문장을
+  /// 모두 취소하고 이 문장을 바로 재생한다. (장애물/신호등 같은 긴급 알림)
+  Future<void> _speak(
+    String text, {
+    bool interrupt = false,
+  }) {
+    final String message = text.trim();
+    if (message.isEmpty) return Future<void>.value();
 
+    debugPrint('[TTS REQUEST] $message (interrupt: $interrupt)');
+
+    if (interrupt) {
+      _ttsGeneration++;
+      _completeCurrentTts();
+      unawaited(_tts.stop());
+    }
+
+    final int generation = _ttsGeneration;
+
+    _pendingTtsCount++;
+    _setSpeaking(true);
+
+    final Future<void> job = _ttsQueue.then((_) async {
+      // 긴급 알림 때문에 취소된 문장은 건너뛴다.
+      if (generation != _ttsGeneration || !mounted) {
+        debugPrint('[TTS SKIPPED] $message');
+        return;
+      }
+
+      await _speakNow(message);
+    }).whenComplete(() {
+      _pendingTtsCount--;
+
+      if (_pendingTtsCount <= 0) {
+        _pendingTtsCount = 0;
+        _setSpeaking(false);
+      }
+    });
+
+    _ttsQueue = job.catchError((Object _) {});
+
+    return job;
+  }
+
+  Future<void> _speakNow(String text) async {
     if (_speech.isListening) {
       try {
         await _speech.stop();
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[STT STOP ERROR] $e');
+      }
     }
 
-    if (mounted) {
+    if (mounted && _isListening) {
       setState(() {
         _isListening = false;
-        _isSpeaking = true;
       });
-    } else {
-      _isSpeaking = true;
     }
 
+    final Completer<void> done = Completer<void>();
+    _ttsDone = done;
+
     try {
-      await _tts.stop();
-      await _tts.speak(text);
+      final dynamic result = await _tts.speak(text);
+
+      debugPrint('[TTS SPEAK RESULT] $result : $text');
+
+      // 1 = 재생 시작 성공. 실패했으면 완료 이벤트가 오지 않으므로 바로 끝낸다.
+      if (result != 1) {
+        _completeCurrentTts();
+      }
+
+      // 완료 이벤트가 누락돼도 대기열이 멈추지 않도록 시간 제한을 둔다.
+      await done.future.timeout(
+        _estimateSpeechDuration(text),
+        onTimeout: () {
+          debugPrint('[TTS TIMEOUT] $text');
+        },
+      );
+    } catch (e) {
+      debugPrint('[TTS ERROR] $e');
     } finally {
-      _isSpeaking = false;
-      if (mounted) {
-        setState(() {});
+      if (identical(_ttsDone, done)) {
+        _ttsDone = null;
       }
     }
   }
 
+  void _completeCurrentTts() {
+    final Completer<void>? done = _ttsDone;
+
+    if (done != null && !done.isCompleted) {
+      done.complete();
+    }
+  }
+
+  Duration _estimateSpeechDuration(String text) {
+    // 한국어, 속도 0.45 기준으로 넉넉하게 잡는다.
+    final int ms = 3000 + text.length * 350;
+    return Duration(milliseconds: ms.clamp(5000, 20000));
+  }
+
+  void _setSpeaking(bool value) {
+    if (_isSpeaking == value) return;
+
+    _isSpeaking = value;
+
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  /// 대기열에 남은 음성이 모두 끝날 때까지 기다린다.
+  Future<void> _waitForTtsIdle() async {
+    while (_pendingTtsCount > 0 && mounted) {
+      await _ttsQueue;
+    }
+  }
+
+  /// 장애물/신호등 같은 알림을 재생한다.
+  ///
+  /// 같은 [key]의 알림은 [cooldown] 안에 다시 재생하지 않는다.
+  /// 재생 요청을 했으면 true를 반환한다.
+  bool _speakAlert(
+    String key,
+    String text, {
+    Duration cooldown = const Duration(seconds: 5),
+    bool interrupt = true,
+  }) {
+    final DateTime now = DateTime.now();
+    final DateTime? last = _lastAlertSpokenAt[key];
+
+    if (last != null && now.difference(last) < cooldown) {
+      debugPrint('[TTS ALERT SKIP] $key (cooldown)');
+      return false;
+    }
+
+    _lastAlertSpokenAt[key] = now;
+
+    debugPrint('[TTS ALERT] $key: $text');
+
+    unawaited(_speak(text, interrupt: interrupt));
+
+    return true;
+  }
+
   Future<void> _speakAndListen(String message) async {
     await _speak(message);
+    await _waitForTtsIdle();
     await Future<void>.delayed(const Duration(milliseconds: 500));
 
     if (!mounted) return;
@@ -550,6 +730,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     }
 
     await _speak(guideMessage);
+    await _waitForTtsIdle();
     await Future<void>.delayed(const Duration(milliseconds: 600));
 
     if (!mounted || _isNavigationActive || _isSearchingRoute) return;
@@ -1167,8 +1348,8 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       await _sendBearingToCaneIfNeeded(targetBearing);
 
       if (steeringError != null &&
-        !_isCrosswalkMode &&
-        !_obstacleConfirmed) {
+          !_isCrosswalkMode &&
+          !_obstacleConfirmed) {
         final String command = _motorCommandForAngle(steeringError);
 
         await _sendMotorCommandToCaneIfNeeded(
@@ -1651,6 +1832,8 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
               _notifyCharacteristic = null;
 
               _distanceCm = null;
+              _leftDistanceCm = null;
+              _rightDistanceCm = null;
 
               _obstacleConfirmed = false;
 
@@ -1660,6 +1843,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
               _crosswalkSteering = 'NONE';
             });
 
+            _frontWarningArmed = true;
             _resetMotorCommandCache();
           }
         },
@@ -1761,54 +1945,54 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   }
 
   Future<void> _sendMotorCommandToCaneIfNeeded(
-      String command, {
-      required double angle,
-    }) async {
-      if (!_isBleConnected) return;
+    String command, {
+    required double angle,
+  }) async {
+    if (!_isBleConnected) return;
 
-      // 횡단보도에서는 Raspberry Pi가 제어
-      if (_isCrosswalkMode) {
-        return;
-      }
-
-      // ESP32가 장애물을 처리하는 동안
-      // Flutter의 L/R/F 명령 차단
-      if (_obstacleConfirmed) {
-        return;
-      }
-
-      final DateTime now = DateTime.now();
-
-      final bool commandChanged =
-          command != _lastMotorCommand;
-
-      final bool angleChanged =
-          _lastMotorAngle == null ||
-          (angle - _lastMotorAngle!).abs() >= 5.0;
-
-      final bool enoughTime =
-          _lastMotorSentAt == null ||
-          now.difference(_lastMotorSentAt!).inMilliseconds >= 700;
-
-      if (!commandChanged &&
-          !angleChanged &&
-          !enoughTime) {
-        return;
-      }
-
-      _lastMotorCommand = command;
-      _lastMotorAngle = angle;
-      _lastMotorSentAt = now;
-
-      await _sendBleLine(
-        '$command:${angle.toStringAsFixed(1)}',
-      );
-
-      debugPrint(
-        '[NAV -> ESP32] '
-        '$command:${angle.toStringAsFixed(1)}',
-      );
+    // 횡단보도에서는 Raspberry Pi가 제어
+    if (_isCrosswalkMode) {
+      return;
     }
+
+    // ESP32가 장애물을 처리하는 동안
+    // Flutter의 L/R/F 명령 차단
+    if (_obstacleConfirmed) {
+      return;
+    }
+
+    final DateTime now = DateTime.now();
+
+    final bool commandChanged =
+        command != _lastMotorCommand;
+
+    final bool angleChanged =
+        _lastMotorAngle == null ||
+        (angle - _lastMotorAngle!).abs() >= 5.0;
+
+    final bool enoughTime =
+        _lastMotorSentAt == null ||
+        now.difference(_lastMotorSentAt!).inMilliseconds >= 700;
+
+    if (!commandChanged &&
+        !angleChanged &&
+        !enoughTime) {
+      return;
+    }
+
+    _lastMotorCommand = command;
+    _lastMotorAngle = angle;
+    _lastMotorSentAt = now;
+
+    await _sendBleLine(
+      '$command:${angle.toStringAsFixed(1)}',
+    );
+
+    debugPrint(
+      '[NAV -> ESP32] '
+      '$command:${angle.toStringAsFixed(1)}',
+    );
+  }
 
   // ===========================================================================
   // ESP32 -> 앱 수신
@@ -1842,16 +2026,97 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     // DIST:85
     //
     // 앱:
-    // 100cm 이하 -> 화면 장애물 표시
+    // 100cm 이하 -> 화면 장애물 표시 + 음성 경고 1회
+    // 120cm 보다 멀어지면 다시 경고 가능
     // ============================================================
     if (message.startsWith('DIST:')) {
       final double? distance = double.tryParse(
         message.substring('DIST:'.length).trim(),
       );
 
-      if (distance != null && mounted) {
+      if (distance != null) {
+        if (mounted) {
+          setState(() {
+            _distanceCm = distance;
+          });
+        }
+
+        final bool isWarning =
+            distance > 0 && distance <= obstacleWarningCm;
+
+        if (isWarning && _frontWarningArmed) {
+          final bool spoken = _speakAlert(
+            'front_obstacle',
+            '앞에 장애물이 있습니다. 주의하세요.',
+            cooldown: const Duration(seconds: 4),
+          );
+
+          if (spoken) {
+            _frontWarningArmed = false;
+          }
+        } else if (distance > obstacleWarningResetCm) {
+          _frontWarningArmed = true;
+        }
+      }
+
+      return;
+    }
+
+    // ============================================================
+    // 1-1. 좌/우 VL53L1X 거리
+    //
+    // ESP32 -> Flutter
+    // SIDE:왼쪽cm,오른쪽cm
+    // 예: SIDE:82,135
+    // ============================================================
+    if (message.startsWith('SIDE:')) {
+      final String payload =
+          message.substring('SIDE:'.length).trim();
+      final List<String> values = payload.split(',');
+
+      if (values.length >= 2) {
+        final double? left =
+            double.tryParse(values[0].trim());
+        final double? right =
+            double.tryParse(values[1].trim());
+
+        if (mounted) {
+          setState(() {
+            _leftDistanceCm =
+                (left != null && left > 0) ? left : null;
+            _rightDistanceCm =
+                (right != null && right > 0) ? right : null;
+          });
+        }
+      }
+
+      return;
+    }
+
+    // LEFT_DIST / RIGHT_DIST 형식도 같이 지원
+    // 나중에 ESP32 메시지 형식을 따로 보낼 때 그대로 사용 가능.
+    if (message.startsWith('LEFT_DIST:')) {
+      final double? distance = double.tryParse(
+        message.substring('LEFT_DIST:'.length).trim(),
+      );
+
+      if (distance != null && distance > 0 && mounted) {
         setState(() {
-          _distanceCm = distance;
+          _leftDistanceCm = distance;
+        });
+      }
+
+      return;
+    }
+
+    if (message.startsWith('RIGHT_DIST:')) {
+      final double? distance = double.tryParse(
+        message.substring('RIGHT_DIST:'.length).trim(),
+      );
+
+      if (distance != null && distance > 0 && mounted) {
+        setState(() {
+          _rightDistanceCm = distance;
         });
       }
 
@@ -1865,7 +2130,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     // OBSTACLE:25
     //
     // 이 메시지를 보낸 직후 ESP32가
-    // 양쪽 모터에 역토크 3회를 자체적으로 실행함.
+    // 좌/우 VL53L1X 거리를 비교해 회피 방향을 결정함.
     // ============================================================
     if (message.startsWith('OBSTACLE:')) {
       final double? distance = double.tryParse(
@@ -1882,11 +2147,19 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         });
       }
 
-      // 장애물 처리 중 Flutter의 이전 L/R/F 캐시 초기화
       _resetMotorCommandCache();
 
+      // 100cm 경고와 같은 문장이 연달아 나오지 않도록 다른 문장 사용.
+      // 지금 나오는 음성을 끊고 바로 알린다.
+      _frontWarningArmed = false;
+      _speakAlert(
+        'obstacle_confirmed',
+        '장애물이 바로 앞에 있습니다. 멈추세요.',
+        cooldown: const Duration(seconds: 3),
+      );
+
       debugPrint(
-        '[OBSTACLE] confirmed - ESP32 reverse torque x3',
+        '[OBSTACLE] confirmed - ESP32 side-distance avoidance',
       );
 
       return;
@@ -1937,8 +2210,11 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       _resetMotorCommandCache();
 
       if (!wasDetected) {
-        unawaited(
-          _speakCrosswalkDetectedOnce(),
+        _speakAlert(
+          'crosswalk',
+          '횡단보도를 인식했습니다.',
+          cooldown: const Duration(seconds: 10),
+          interrupt: false,
         );
       }
 
@@ -1953,21 +2229,21 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     // CROSSWALK:0
     // ============================================================
     if (message == 'CROSSWALK:0') {
-    if (mounted) {
-      setState(() {
-        _crosswalkDetected = false;
-        _isCrosswalkMode = false;
-        _trafficLight = 'NONE';
-        _crosswalkSteering = 'NONE';
-      });
+      if (mounted) {
+        setState(() {
+          _crosswalkDetected = false;
+          _isCrosswalkMode = false;
+          _trafficLight = 'NONE';
+          _crosswalkSteering = 'NONE';
+        });
+      }
+
+      _resetMotorCommandCache();
+
+      debugPrint('[MODE] NORMAL NAVIGATION');
+
+      return;
     }
-
-    _resetMotorCommandCache();
-
-    debugPrint('[MODE] NORMAL NAVIGATION');
-
-    return;
-  }
 
     // ============================================================
     // 6. 빨간불
@@ -1989,17 +2265,16 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
       _resetMotorCommandCache();
 
-      if (!oldCrosswalk) {
-        unawaited(
-          _speak('횡단보도를 인식했습니다.'),
-        );
-      }
-
+      // 예전에는 "횡단보도를 인식했습니다."와 "빨간불입니다..."를
+      // 연달아 두 번 speak() 해서 두 번째 호출이 첫 번째를 끊고,
+      // 결국 둘 다 들리지 않았다. 한 문장으로 합쳐서 한 번만 재생한다.
       if (oldLight != 'RED') {
-        unawaited(
-          _speak(
-            '빨간불을 인식했습니다. 정지하세요.',
-          ),
+        _speakAlert(
+          'light_red',
+          oldCrosswalk
+              ? '빨간불입니다. 정지하세요.'
+              : '횡단보도를 인식했습니다. 빨간불입니다. 정지하세요.',
+          cooldown: const Duration(seconds: 8),
         );
       }
 
@@ -2028,17 +2303,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
       _resetMotorCommandCache();
 
-      if (!oldCrosswalk) {
-        unawaited(
-          _speak('횡단보도를 인식했습니다.'),
-        );
-      }
-
       if (oldLight != 'GREEN') {
-        unawaited(
-          _speak(
-            '초록불을 인식했습니다. 건너도 됩니다.',
-          ),
+        _speakAlert(
+          'light_green',
+          oldCrosswalk
+              ? '초록불입니다. 건너세요.'
+              : '횡단보도를 인식했습니다. 초록불입니다. 건너세요.',
+          cooldown: const Duration(seconds: 8),
         );
       }
 
@@ -2107,6 +2378,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
       return;
     }
+
     // ============================================================
     // 11. 횡단보도 주행 방향 보정
     //
@@ -2156,6 +2428,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
       return;
     }
+
     // ============================================================
     // 12. 모터 동작 확인
     //
@@ -2175,12 +2448,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     _lastMotorCommand = null;
     _lastMotorAngle = null;
     _lastMotorSentAt = null;
-  }
-
-  Future<void> _speakCrosswalkDetectedOnce() async {
-    await _speak(
-      '횡단보도를 인식했습니다.',
-    );
   }
 
   // ===========================================================================
@@ -2228,6 +2495,69 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     if (_trafficLight == 'RED') return Colors.red;
     if (_trafficLight == 'GREEN') return Colors.green;
     return Colors.grey;
+  }
+
+  Widget _distanceSensorBox({
+    required String title,
+    required IconData icon,
+    required double? distanceCm,
+    required double warningDistanceCm,
+  }) {
+    final bool warning = distanceCm != null &&
+        distanceCm > 0 &&
+        distanceCm <= warningDistanceCm;
+
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          horizontal: 8,
+          vertical: 12,
+        ),
+        decoration: BoxDecoration(
+          color: warning
+              ? Colors.red.shade50
+              : Colors.grey.shade100,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: warning
+                ? Colors.red.shade300
+                : Colors.grey.shade300,
+          ),
+        ),
+        child: Column(
+          children: [
+            Icon(
+              icon,
+              size: 26,
+              color: warning ? Colors.red : Colors.deepPurple,
+            ),
+            const SizedBox(height: 5),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                distanceCm == null
+                    ? '-- cm'
+                    : '${distanceCm.toStringAsFixed(0)} cm',
+                style: TextStyle(
+                  fontSize: 27,
+                  fontWeight: FontWeight.bold,
+                  color: warning ? Colors.red : Colors.black87,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -2553,84 +2883,98 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
             ),
 
             // -----------------------------------------------------------------
-            // TFmini
+            // 거리 센서: LEFT VL53L1X / FRONT TFmini / RIGHT VL53L1X
             // -----------------------------------------------------------------
             _sectionCard(
               child: Column(
                 children: [
                   const Text(
-                    'TFmini 측정 거리',
+                    '장애물 거리 센서',
                     style: TextStyle(
                       fontWeight: FontWeight.bold,
                     ),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 12),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      _distanceSensorBox(
+                        title: '왼쪽\nVL53L1X',
+                        icon: Icons.arrow_back,
+                        distanceCm: _leftDistanceCm,
+                        warningDistanceCm: 30.0,
+                      ),
+                      const SizedBox(width: 8),
+                      _distanceSensorBox(
+                        title: '정면\nTFmini',
+                        icon: Icons.arrow_upward,
+                        distanceCm: _distanceCm,
+                        warningDistanceCm: obstacleWarningCm,
+                      ),
+                      const SizedBox(width: 8),
+                      _distanceSensorBox(
+                        title: '오른쪽\nVL53L1X',
+                        icon: Icons.arrow_forward,
+                        distanceCm: _rightDistanceCm,
+                        warningDistanceCm: 30.0,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
                   Text(
-                    _distanceCm == null
-                        ? '-- cm'
-                        : '${_distanceCm!.toStringAsFixed(0)} cm',
-                    style: const TextStyle(
-                      fontSize: 36,
-                      fontWeight: FontWeight.bold,
+                    '정면 100 cm 이내: 화면·음성 장애물 경고  •  '
+                    '정면 30 cm 이하 3회: 좌우 거리 비교 후 회피',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.grey.shade700,
                     ),
                   ),
                   if (obstacleDetected) ...[
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 10),
                     const Text(
-                      '장애물 감지',
+                      '정면 장애물 감지',
                       style: TextStyle(
                         color: Colors.red,
                         fontSize: 21,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    const Text(
-                      '100 cm 이내',
-                      style: TextStyle(
-                        color: Colors.red,
-                      ),
-                    ),
                   ],
-
                   if (_obstacleConfirmed) ...[
                     const SizedBox(height: 12),
-
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: Colors.red.shade50,
+                        color: Colors.orange.shade50,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
-                          color: Colors.red.shade200,
+                          color: Colors.orange.shade300,
                         ),
                       ),
                       child: const Column(
                         children: [
                           Text(
-                            'ESP32 장애물 경고',
+                            'ESP32 장애물 회피 동작',
                             style: TextStyle(
-                              color: Colors.red,
+                              color: Colors.deepOrange,
                               fontSize: 18,
                               fontWeight: FontWeight.bold,
                             ),
                           ),
-
                           SizedBox(height: 6),
-
                           Text(
-                            '30 cm 이하 장애물 감지',
+                            '정면 30 cm 이하 3회 연속 감지',
                             style: TextStyle(
                               fontWeight: FontWeight.bold,
                             ),
                           ),
-
                           SizedBox(height: 4),
-
                           Text(
-                            '역토크 3회 동작',
+                            '좌·우 VL53L1X 거리를 비교해 더 넓은 방향으로 유도',
+                            textAlign: TextAlign.center,
                             style: TextStyle(
-                              color: Colors.red,
                               fontWeight: FontWeight.bold,
                             ),
                           ),
@@ -2698,43 +3042,40 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
                       ),
                     ],
                   ),
-                if (_isCrosswalkMode) ...[
-                  const Divider(height: 28),
-
-                  Row(
-                    children: [
-                      const Icon(
-                        Icons.compare_arrows,
-                        color: Colors.deepPurple,
-                      ),
-
-                      const SizedBox(width: 12),
-
-                      Expanded(
-                        child: Text(
-                          _crosswalkSteering == 'LEFT'
-                              ? '횡단보도 보정: 왼쪽'
-                              : _crosswalkSteering == 'RIGHT'
-                                  ? '횡단보도 보정: 오른쪽'
-                                  : _crosswalkSteering == 'CENTER'
-                                      ? '횡단보도 중앙 유지'
-                                      : '횡단보도 방향 판단 중',
-                          style: const TextStyle(
-                            fontSize: 20,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.deepPurple,
+                  if (_isCrosswalkMode) ...[
+                    const Divider(height: 28),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.compare_arrows,
+                          color: Colors.deepPurple,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            _crosswalkSteering == 'LEFT'
+                                ? '횡단보도 보정: 왼쪽'
+                                : _crosswalkSteering == 'RIGHT'
+                                    ? '횡단보도 보정: 오른쪽'
+                                    : _crosswalkSteering == 'CENTER'
+                                        ? '횡단보도 중앙 유지'
+                                        : '횡단보도 방향 판단 중',
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.deepPurple,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
-                  ),
-                ],
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
 
             Text(
-              'TFmini는 거리만 표시하며 장애물 음성은 출력하지 않습니다.',
+              '정면 TFmini와 좌·우 VL53L1X 거리를 BLE로 표시합니다.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 12,
