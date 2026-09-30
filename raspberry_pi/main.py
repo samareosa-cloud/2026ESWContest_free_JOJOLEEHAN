@@ -20,6 +20,87 @@ YELLOW_HSV_LOWER = np.array([15, 60, 80])
 YELLOW_HSV_UPPER = np.array([45, 255, 255])
 
 # ====================================================================
+# [튜닝 변수] 횡단 중 방향 보정
+# ====================================================================
+# 횡단보도 박스 중심이 화면 중심에서 "화면 폭 x 이 비율"보다 멀면
+# 줄무늬 각도보다 "횡단보도 중앙으로 가기"를 먼저 한다. (예전: 25% 고정)
+CENTER_ENTER_RATIO = 0.12
+# 중앙으로 가는 중에는 이 비율 안으로 들어와야 각도(직진 유지) 판단으로 돌아간다.
+CENTER_EXIT_RATIO = 0.06
+
+# 줄무늬 각도 판단 문턱값(도). 흔들림이 심하면 ENTER를 4~6으로 올린다.
+ANGLE_ENTER_DEG = 3.0
+ANGLE_EXIT_DEG = 2.0
+
+# 카메라를 180도 돌려 달아서 좌/우를 뒤집어 보낸다.
+# 시연 전 꼭 확인: 횡단보도가 카메라 기준 왼쪽에 있을 때
+# 지팡이가 왼쪽으로 당겨야 정상. 반대로 당기면 False로 바꾼다.
+FLIP_LEFT_RIGHT = True
+
+# ====================================================================
+# [ESP32 전송] 메시지 이름은 docs/PROTOCOL.md 기준 (ESP32/앱과 공통)
+# ====================================================================
+# 건너는 동안 현재 보정 방향(CROSS_MOTOR:L/R/CENTER)을 이 간격(초)으로
+# 계속 다시 보낸다. ESP32는 1초 동안 소식이 없으면 스스로 멈춘다.
+CROSS_RESEND_SEC = 0.3
+
+CROSSING_EVENTS = ["STRAIGHT", "LEFT_CORRECTION", "RIGHT_CORRECTION"]
+
+
+def esp_messages_for_event(event, stable_color, has_seen_red):
+    """라즈베리파이 내부 상태 -> ESP32/앱 공통 메시지 목록."""
+    if event == "NORMAL":
+        return ["CROSSWALK:0"]
+    if event == "CROSSWALK_AHEAD":
+        return ["CROSSWALK:1"]
+    if event == "WAIT_SIGNAL":
+        # 빨간불을 못 보고 초록불부터 봤다 = 남은 시간을 모름 -> 다음 신호 대기
+        if stable_color == "GREEN" and not has_seen_red:
+            return ["LIGHT:GREEN_WAIT"]
+        return ["LIGHT:RED"]
+    if event == "CROSSING_START":
+        return ["LIGHT:GREEN", "CROSSING_START"]
+    if event == "STRAIGHT":
+        return ["CROSS_MOTOR:CENTER"]
+    if event == "LEFT_CORRECTION":
+        return ["CROSS_MOTOR:L"]
+    if event == "RIGHT_CORRECTION":
+        return ["CROSS_MOTOR:R"]
+    if event == "CROSSING_END":
+        return ["CROSSING_END"]
+    return []
+
+
+class EspLink:
+    """바뀐 메시지는 바로, 횡단 중 보정 메시지는 주기적으로 다시 보낸다."""
+
+    def __init__(self, ser):
+        self.ser = ser
+        self.last_messages = None
+        self.last_sent_time = 0.0
+
+    def update(self, messages, repeat, now):
+        changed = messages != self.last_messages
+        resend = repeat and (now - self.last_sent_time) >= CROSS_RESEND_SEC
+
+        if not messages or (not changed and not resend):
+            return []
+
+        if changed:
+            print(f"[ESP32 전송] {' / '.join(messages)}")
+
+        if self.ser is not None:
+            try:
+                for message in messages:
+                    self.ser.write(f"{message}\n".encode("utf-8"))
+            except Exception as e:
+                print(f" └-> [ESP32 데이터 전송 실패]: {e}")
+
+        self.last_messages = messages
+        self.last_sent_time = now
+        return messages
+
+# ====================================================================
 # [예외 처리] pyserial 모듈 확인
 # ====================================================================
 try:
@@ -102,15 +183,15 @@ def analyze_crosswalk_angle(roi, offset_x, offset_y, frame, state, alpha=0.2):
             # 비대칭 문턱값 적용 (Hysteresis)
             current_dir = state['direction']
             if current_dir == "Straight":
-                if ema_angle < -3.0: state['direction'] = "Turn Right"
-                elif ema_angle > 3.0: state['direction'] = "Turn Left"
+                if ema_angle < -ANGLE_ENTER_DEG: state['direction'] = "Turn Right"
+                elif ema_angle > ANGLE_ENTER_DEG: state['direction'] = "Turn Left"
             elif current_dir == "Turn Right":
-                if ema_angle >= -2.0:
-                    if ema_angle > 3.0: state['direction'] = "Turn Left"
+                if ema_angle >= -ANGLE_EXIT_DEG:
+                    if ema_angle > ANGLE_ENTER_DEG: state['direction'] = "Turn Left"
                     else: state['direction'] = "Straight"
             elif current_dir == "Turn Left":
-                if ema_angle <= 3.0:
-                    if ema_angle < -2.0: state['direction'] = "Turn Right"
+                if ema_angle <= ANGLE_EXIT_DEG:
+                    if ema_angle < -ANGLE_ENTER_DEG: state['direction'] = "Turn Right"
                     else: state['direction'] = "Straight"
 
             cw_direction = state['direction']
@@ -167,6 +248,8 @@ if HAS_SERIAL:
     except Exception as e:
         print(f"ESP32 시리얼 연결 실패 (통신 없이 진행합니다): {e}")
 
+esp_link = EspLink(esp_serial)
+
 # PiCamera2 초기화
 picam2 = None
 if HAS_PICAM2:
@@ -190,7 +273,6 @@ print("-------------------------------------------------------------------------
 
 # 상태 제어 글로벌 변수
 event = "NORMAL"
-last_sent_event = ""
 
 # 신호등 히스테리시스 변수
 stable_color = "Unknown"
@@ -205,7 +287,8 @@ red_frames = 0
 green_frames = 0
 missing_cw_frames = 0
 has_seen_red = False
-state_crosswalk = {'ema_angle': 0.0, 'direction': 'Straight', 'initialized': False}
+state_crosswalk = {'ema_angle': 0.0, 'direction': 'Straight', 'initialized': False, 'centering': False}
+center_offset_ratio = 0.0
 
 try:
     while True:
@@ -222,7 +305,6 @@ try:
 
         frame_h, frame_w = frame.shape[:2]
         frame_center_x = frame_w // 2
-        center_margin_cw = int(frame_w * 0.25)
         bottom_40_percent_y = int(frame_h * 0.4)
 
         results = model(frame, stream=False, verbose=False)
@@ -274,10 +356,19 @@ try:
             cx1, cy1, cx2, cy2 = largest_cw_box
             box_center_x = (cx1 + cx2) // 2
 
-            if box_center_x < (frame_center_x - center_margin_cw):
+            # 횡단보도가 화면 한쪽으로 치우쳐 있으면(= 사용자가 횡단보도
+            # 한쪽 끝에 있음) 먼저 횡단보도 중앙 쪽으로 보낸다.
+            center_offset_ratio = (box_center_x - frame_center_x) / frame_w
+            if state_crosswalk['centering']:
+                centering = abs(center_offset_ratio) > CENTER_EXIT_RATIO
+            else:
+                centering = abs(center_offset_ratio) > CENTER_ENTER_RATIO
+            state_crosswalk['centering'] = centering
+
+            if centering and center_offset_ratio < 0:
                 cw_direction = "Turn Left"
                 state_crosswalk['direction'] = "Turn Left"
-            elif box_center_x > (frame_center_x + center_margin_cw):
+            elif centering:
                 cw_direction = "Turn Right"
                 state_crosswalk['direction'] = "Turn Right"
             else:
@@ -305,10 +396,11 @@ try:
 
             # 화면에 표시하고 ESP32 보정에 사용할 좌우 방향을 반대로 적용합니다.
             # 내부 각도 추적 상태는 원래 기준으로 유지합니다.
-            if cw_direction == "Turn Left":
-                cw_direction = "Turn Right"
-            elif cw_direction == "Turn Right":
-                cw_direction = "Turn Left"
+            if FLIP_LEFT_RIGHT:
+                if cw_direction == "Turn Left":
+                    cw_direction = "Turn Right"
+                elif cw_direction == "Turn Right":
+                    cw_direction = "Turn Left"
 
             # 방향과 관계없이 박스 아래쪽이 화면 높이의 40%에 닿으면 진입 후보입니다.
             if cy2 >= bottom_40_percent_y:
@@ -387,6 +479,10 @@ try:
                     event = "CROSSWALK_AHEAD"
                     red_frames, green_frames, missing_cw_frames = 0, 0, 0
                     has_seen_red = False
+                    # 이전 횡단보도에서 본 신호색이 남아 있지 않게 초기화
+                    stable_color = "Unknown"
+                    candidate_color = "Unknown"
+                    candidate_frames = 0
             else:
                 cw_close_frames = max(0, cw_close_frames - 1)
 
@@ -430,20 +526,13 @@ try:
         # ====================================================================
         # [데이터 전송] ESP32 통신
         # ====================================================================
-        if event != last_sent_event:
-            print(f"[상태 변경 감지] 현재 로봇 상태: {event}")
-
-            if esp_serial is not None:
-                try:
-                    data_to_send = f"{event}\n"
-                    esp_serial.write(data_to_send.encode('utf-8'))
-                    print(f" └-> [ESP32 데이터 전송 완료]")
-                except Exception as e:
-                    print(f" └-> [ESP32 데이터 전송 실패]: {e}")
-            else:
-                print(" └-> [ESP32 미연결] 시리얼 전송 생략 (AI는 계속 동작합니다)")
-
-            last_sent_event = event
+        # 내부 상태 이름을 ESP32/앱 공통 메시지로 바꿔서 보낸다.
+        # 건너는 중에는 보정 방향을 CROSS_RESEND_SEC마다 반복 전송한다.
+        esp_link.update(
+            esp_messages_for_event(event, stable_color, has_seen_red),
+            repeat=event in CROSSING_EVENTS,
+            now=time.time(),
+        )
 
         # CROSSING_START/END 는 1틱용 플래그이므로 바로 전환
         if event == "CROSSING_START": event = "STRAIGHT"
@@ -482,7 +571,7 @@ try:
         cv2.putText(frame, f"Color:{stable_color}", (9, 39), hud_font, 0.40, (255, 255, 255), 1)
         cv2.putText(frame, f"Cand:{candidate_color} {candidate_frames}/10", (9, 57), hud_font, 0.38, (200, 200, 200), 1)
         cv2.putText(frame, f"TL miss:{tl_missing_frames}/20  Red:{has_seen_red}", (9, 75), hud_font, 0.36, (0, 165, 255), 1)
-        cv2.putText(frame, "CW start:40%", (9, 93), hud_font, 0.36, (200, 200, 200), 1)
+        cv2.putText(frame, f"CW start:40%  off:{center_offset_ratio:+.2f}", (9, 93), hud_font, 0.36, (200, 200, 200), 1)
 
         cv2.imshow('Pi4 + Camera Mod 3 AI', frame)
 
