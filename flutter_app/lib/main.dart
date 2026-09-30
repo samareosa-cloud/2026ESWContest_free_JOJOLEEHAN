@@ -81,16 +81,43 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   static const double obstacleWarningCm = 30.0;
 
   // ===========================================================================
-  // 실제 도로 주행용 경로/방위각 허용값
+  // 실제 도로 주행용 경로 허용값
   // ===========================================================================
-  // TMAP 경로선에서 좌우 1 m까지는 정상 경로로 판단
-  static const double routeToleranceMeters = 1.0;
+  // TMAP 경로선(지도 위 초록색 선)에서 좌우 이 거리까지는 경로 위로 간주한다.
+  // 이 폭 안에서는 선 위로 끌어당기지 않고 경로와 나란히 걷도록만 안내한다.
+  // (인도 폭 + 스마트폰 GPS 오차 3~5 m 감안)
+  static const double routeToleranceMeters = 5.0;
 
-  // 목표 방위각과 스마트폰 방위각 오차가 ±15° 이내면 직진
-  static const double headingToleranceDegrees = 15.0;
+  // GPS 정확도(accuracy)가 나쁘면 그 오차만큼 허용 폭을 넓힌다. 최대 이 값까지.
+  static const double maxRouteToleranceMeters = 10.0;
 
-  // 정상 경로 위에서는 약 8 m 앞 경로점을 바라보도록 함
+  // 경로 진행 방향은 경로를 따라 이 거리만큼 앞 지점을 기준으로 계산한다.
+  // 허용 폭을 벗어났을 때도 이 거리만큼 앞에서 완만하게 경로에 합류시킨다.
   static const double routeLookAheadMeters = 8.0;
+
+  // ===========================================================================
+  // 나침반 민감도 (직진 / 왼쪽 / 오른쪽 판단)
+  // ===========================================================================
+  // 목표 방위각과 나침반 방위각 오차가 ±이 값을 넘어야 좌/우 유도를 시작한다.
+  static const double headingToleranceDegrees = 25.0;
+
+  // 좌/우 유도 중에는 오차가 ±이 값 안으로 들어와야 다시 직진으로 바뀐다.
+  // (경계값 근처에서 직진 ↔ 좌/우가 계속 바뀌지 않도록 하는 히스테리시스)
+  static const double headingReleaseDegrees = 15.0;
+
+  // 나침반 값 평활화 시간(초). 클수록 흔들림에 둔감하지만 반응은 느려진다.
+  static const double compassSmoothingSeconds = 0.7;
+
+  // 좌/우 판단이 이 시간 이상 계속 유지되어야 실제 모터 명령으로 보낸다.
+  static const Duration steeringHoldDuration = Duration(milliseconds: 700);
+
+  // 같은 방향 명령(F/L/R)을 다시 보내는 최소 간격
+  static const Duration motorRepeatInterval = Duration(milliseconds: 1500);
+
+  // 자기 편각 보정. Android 나침반은 자북 기준이고 TMAP 경로는 진북 기준이라
+  // 한국에서는 약 9° 차이가 난다. (WMM-2025: 서울 -9.0°, 부산 -8.5°, 제주 -7.8°)
+  // iOS(flutter_compass)는 이미 진북(trueHeading)을 주므로 Android에서만 적용한다.
+  static const double magneticDeclinationDegrees = -9.0;
 
   // ===========================================================================
   // 객체 / 스트림
@@ -142,6 +169,15 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   double? _distanceToDestinationMeters;
   double? _distanceToNextPointMeters;
 
+  // 경로선과의 거리 / 지금 적용 중인 허용 폭 (화면 표시용)
+  double? _routeDeviationMeters;
+  double? _currentRouteToleranceMeters;
+
+  // 나침반 평활화 상태. 359° → 0° 경계에서 튀지 않도록 sin/cos로 평균한다.
+  double _headingSin = 0.0;
+  double _headingCos = 1.0;
+  DateTime? _lastCompassEventAt;
+
   List<LatLng> get _routeLatLngs => _routePoints
       .map((point) => LatLng(point.latitude, point.longitude))
       .toList();
@@ -162,8 +198,12 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   DateTime? _lastBearingSentAt;
 
   String? _lastMotorCommand;
-  double? _lastMotorAngle;
   DateTime? _lastMotorSentAt;
+
+  // 지금 실제로 유도 중인 방향(F/L/R)과, 유지 시간을 기다리는 좌/우 판단
+  String _steeringCommand = 'F';
+  String? _pendingSteeringCommand;
+  DateTime? _pendingSteeringSince;
 
   bool _isCrosswalkMode = false;
 
@@ -714,9 +754,12 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         _steeringError = null;
         _distanceToDestinationMeters = null;
         _distanceToNextPointMeters = null;
+        _routeDeviationMeters = null;
+        _currentRouteToleranceMeters = null;
         _speechStatus = '${destination.name} 경로 검색 완료';
       });
 
+      _resetMotorCommandCache();
       _moveMapToCurrentLocation();
 
       await _startLocationTracking();
@@ -1178,50 +1221,39 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         routePoints: _routePoints,
       );
 
+      final double routeTolerance = _routeToleranceFor(currentPosition);
+
       final bool isInsideRouteTolerance =
-          routeProjection.distanceMeters <= routeToleranceMeters;
+          routeProjection.distanceMeters <= routeTolerance;
 
-      late final RoutePoint guidancePoint;
+      // 허용 폭 안: 선 위로 끌어당기지 않고 경로와 나란한 방향을 목표로 함.
+      // 허용 폭 밖: 벗어난 거리만큼만 경로 쪽으로 틀어 완만하게 복귀시킨다.
+      final double targetBearing = _calculateRouteFollowingBearing(
+        currentPosition: currentPosition,
+        projection: routeProjection,
+        routePoints: _routePoints,
+        routeTolerance: routeTolerance,
+        destination: destination,
+      );
 
-      if (isInsideRouteTolerance) {
-        // 경로선 ±1 m 안: 기존처럼 진행 방향의 약 8 m 앞 경로점을 목표로 함.
-        guidancePoint = _findNextRoutePoint(
-          currentPosition: currentPosition,
-          routePoints: _routePoints,
-        );
-      } else {
-        // 경로선에서 1 m보다 멀리 벗어남:
-        // 가장 가까운 경로선상의 점을 목표로 잡아 경로 쪽으로 복귀시킨다.
-        guidancePoint = routeProjection.nearestPoint;
-      }
+      final RoutePoint nextRoutePoint = _routePoints[math.min(
+        routeProjection.segmentIndex + 1,
+        _routePoints.length - 1,
+      )];
 
       final double distanceToNextPoint = Geolocator.distanceBetween(
         currentPosition.latitude,
         currentPosition.longitude,
-        guidancePoint.latitude,
-        guidancePoint.longitude,
-      );
-
-      final double targetBearing = _calculateTargetBearing(
-        startLatitude: currentPosition.latitude,
-        startLongitude: currentPosition.longitude,
-        destinationLatitude: guidancePoint.latitude,
-        destinationLongitude: guidancePoint.longitude,
+        nextRoutePoint.latitude,
+        nextRoutePoint.longitude,
       );
 
       debugPrint(
         '[ROUTE] deviation=${routeProjection.distanceMeters.toStringAsFixed(2)}m '
-        'inside1m=$isInsideRouteTolerance '
-        'target=${isInsideRouteTolerance ? 'LOOK_AHEAD' : 'RETURN_TO_ROUTE'}',
+        'tolerance=${routeTolerance.toStringAsFixed(1)}m '
+        'target=${isInsideRouteTolerance ? 'FOLLOW_ROUTE' : 'RETURN_TO_ROUTE'} '
+        'bearing=${targetBearing.toStringAsFixed(0)}',
       );
-
-      final double? heading = _phoneHeading;
-      final double? steeringError = heading == null
-          ? null
-          : _signedAngleDifference(
-              targetBearing,
-              heading,
-            );
 
       if (mounted) {
         setState(() {
@@ -1231,24 +1263,17 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
           );
 
           _targetBearing = targetBearing;
-          _steeringError = steeringError;
           _distanceToDestinationMeters = distanceToDestination;
           _distanceToNextPointMeters = distanceToNextPoint;
+          _routeDeviationMeters = routeProjection.distanceMeters;
+          _currentRouteToleranceMeters = routeTolerance;
         });
       }
 
       await _sendBearingToCaneIfNeeded(targetBearing);
 
-      if (steeringError != null &&
-        !_isCrosswalkMode &&
-        !_obstacleConfirmed) {
-        final String command = _motorCommandForAngle(steeringError);
-
-        await _sendMotorCommandToCaneIfNeeded(
-          command,
-          angle: steeringError.abs(),
-        );
-      }
+      // 목표 방위각이 바뀌었으므로 직진/좌/우 판단도 다시 한다.
+      await _updateSteering();
 
       // 직진 / 왼쪽 / 오른쪽 길안내 TTS는 사용하지 않는다.
       // 화면 표시와 ESP32 방향 명령(F/L/R)은 계속 동작한다.
@@ -1292,11 +1317,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       safeProgressIndex + 80,
     );
 
-    const double earthRadiusMeters = 6371000.0;
-    final double referenceLatRad =
-        _degreeToRadian(currentPosition.latitude);
-    final double cosReferenceLat = math.cos(referenceLatRad);
-
     double bestDistanceMeters = double.infinity;
     RoutePoint bestPoint = routePoints[safeProgressIndex];
     int bestSegmentIndex = safeProgressIndex;
@@ -1307,28 +1327,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
       // 현재 GPS 위치를 원점(0, 0)으로 두고 위경도를 짧은 거리의
       // 평면 좌표(m)로 바꾼 뒤, 원점에서 선분 AB까지의 최단점을 구한다.
-      final double ax = _degreeToRadian(
-            a.longitude - currentPosition.longitude,
-          ) *
-          cosReferenceLat *
-          earthRadiusMeters;
-      final double ay = _degreeToRadian(
-            a.latitude - currentPosition.latitude,
-          ) *
-          earthRadiusMeters;
+      final _LocalMeters localA = _toLocalMeters(currentPosition, a);
+      final _LocalMeters localB = _toLocalMeters(currentPosition, b);
 
-      final double bx = _degreeToRadian(
-            b.longitude - currentPosition.longitude,
-          ) *
-          cosReferenceLat *
-          earthRadiusMeters;
-      final double by = _degreeToRadian(
-            b.latitude - currentPosition.latitude,
-          ) *
-          earthRadiusMeters;
-
-      final double dx = bx - ax;
-      final double dy = by - ay;
+      final double ax = localA.x;
+      final double ay = localA.y;
+      final double dx = localB.x - ax;
+      final double dy = localB.y - ay;
       final double segmentLengthSquared = dx * dx + dy * dy;
 
       double t = 0.0;
@@ -1368,63 +1373,134 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     );
   }
 
-  RoutePoint _findNextRoutePoint({
+  // GPS 오차(accuracy)가 기본 허용 폭보다 크면 그만큼 넓혀서 판단한다.
+  double _routeToleranceFor(Position position) {
+    final double accuracy = position.accuracy;
+
+    if (!accuracy.isFinite || accuracy <= routeToleranceMeters) {
+      return routeToleranceMeters;
+    }
+
+    return math.min(accuracy, maxRouteToleranceMeters);
+  }
+
+  // 초록색 경로선을 정확히 밟지 않아도 되도록, 경로선을 현재 위치 쪽으로
+  // 최대 허용 폭만큼 평행 이동한 "가상 경로"를 따라가게 한다.
+  //  - 허용 폭 안: 가상 경로가 현재 위치를 지나므로 경로 진행 방향만 안내
+  //  - 허용 폭 밖: 가상 경로까지 남은 거리만큼만 경로 쪽으로 틀어 합류
+  //    (틀어 주는 각도 = atan(허용 폭을 넘은 거리 / routeLookAheadMeters))
+  double _calculateRouteFollowingBearing({
     required Position currentPosition,
+    required _RouteProjection projection,
     required List<RoutePoint> routePoints,
+    required double routeTolerance,
+    required Destination destination,
   }) {
-    if (routePoints.isEmpty) {
-      throw StateError('경로 좌표가 없습니다.');
-    }
-
-    if (_routeProgressIndex >= routePoints.length) {
-      _routeProgressIndex = routePoints.length - 1;
-    }
-
-    final int searchEnd = math.min(
-      routePoints.length - 1,
-      _routeProgressIndex + 80,
+    final RoutePoint lookAheadPoint = _pointAlongRoute(
+      projection: projection,
+      routePoints: routePoints,
+      distanceMeters: routeLookAheadMeters,
     );
 
-    int nearestIndex = _routeProgressIndex;
-    double nearestDistance = double.infinity;
+    final _LocalMeters lookAhead =
+        _toLocalMeters(currentPosition, lookAheadPoint);
 
-    for (int i = _routeProgressIndex; i <= searchEnd; i++) {
-      final RoutePoint point = routePoints[i];
+    double targetX = lookAhead.x;
+    double targetY = lookAhead.y;
 
-      final double distance = Geolocator.distanceBetween(
-        currentPosition.latitude,
-        currentPosition.longitude,
-        point.latitude,
-        point.longitude,
-      );
+    final int segmentIndex = projection.segmentIndex;
 
-      if (distance < nearestDistance) {
-        nearestDistance = distance;
-        nearestIndex = i;
+    if (segmentIndex + 1 < routePoints.length) {
+      final _LocalMeters a =
+          _toLocalMeters(currentPosition, routePoints[segmentIndex]);
+      final _LocalMeters b =
+          _toLocalMeters(currentPosition, routePoints[segmentIndex + 1]);
+      final _LocalMeters nearest =
+          _toLocalMeters(currentPosition, projection.nearestPoint);
+
+      final double dx = b.x - a.x;
+      final double dy = b.y - a.y;
+      final double segmentLength = math.sqrt(dx * dx + dy * dy);
+
+      if (segmentLength > 0.001) {
+        // 경로 진행 방향 기준 왼쪽을 가리키는 단위 벡터
+        final double leftX = -dy / segmentLength;
+        final double leftY = dx / segmentLength;
+
+        // 경로선에서 현재 위치까지의 좌우 거리 (+: 경로 왼쪽, -: 경로 오른쪽)
+        final double lateralOffset =
+            -(nearest.x * leftX + nearest.y * leftY);
+
+        final double shift = lateralOffset
+            .clamp(-routeTolerance, routeTolerance)
+            .toDouble();
+
+        targetX += leftX * shift;
+        targetY += leftY * shift;
       }
     }
 
-    if (nearestIndex > _routeProgressIndex) {
-      _routeProgressIndex = nearestIndex;
+    // 경로 끝에 거의 도착해 따라갈 경로가 남아 있지 않으면 목적지 방향 사용
+    if (targetX * targetX + targetY * targetY < 1.0) {
+      return _calculateTargetBearing(
+        startLatitude: currentPosition.latitude,
+        startLongitude: currentPosition.longitude,
+        destinationLatitude: destination.latitude,
+        destinationLongitude: destination.longitude,
+      );
     }
 
-    for (int i = _routeProgressIndex; i < routePoints.length; i++) {
-      final RoutePoint point = routePoints[i];
+    // 평면 좌표(x: 동, y: 북)에서 북쪽 기준 시계 방향 방위각
+    return (_radianToDegree(math.atan2(targetX, targetY)) + 360.0) % 360.0;
+  }
 
-      final double distance = Geolocator.distanceBetween(
-        currentPosition.latitude,
-        currentPosition.longitude,
-        point.latitude,
-        point.longitude,
+  // 경로선 위의 투영점에서 경로를 따라 distanceMeters만큼 앞의 지점
+  RoutePoint _pointAlongRoute({
+    required _RouteProjection projection,
+    required List<RoutePoint> routePoints,
+    required double distanceMeters,
+  }) {
+    double remaining = distanceMeters;
+    RoutePoint from = projection.nearestPoint;
+
+    for (int i = projection.segmentIndex + 1; i < routePoints.length; i++) {
+      final RoutePoint to = routePoints[i];
+
+      final double segmentLength = Geolocator.distanceBetween(
+        from.latitude,
+        from.longitude,
+        to.latitude,
+        to.longitude,
       );
 
-      if (distance >= routeLookAheadMeters) {
-        _routeProgressIndex = i;
-        return point;
+      if (segmentLength > 0 && segmentLength >= remaining) {
+        final double t = remaining / segmentLength;
+
+        return RoutePoint(
+          latitude: from.latitude + (to.latitude - from.latitude) * t,
+          longitude: from.longitude + (to.longitude - from.longitude) * t,
+        );
       }
+
+      remaining -= segmentLength;
+      from = to;
     }
 
     return routePoints.last;
+  }
+
+  // 현재 위치를 원점으로 하는 짧은 거리용 평면 좌표(m)
+  _LocalMeters _toLocalMeters(Position origin, RoutePoint point) {
+    const double earthRadiusMeters = 6371000.0;
+    final double cosOriginLat = math.cos(_degreeToRadian(origin.latitude));
+
+    return (
+      x: _degreeToRadian(point.longitude - origin.longitude) *
+          cosOriginLat *
+          earthRadiusMeters,
+      y: _degreeToRadian(point.latitude - origin.latitude) *
+          earthRadiusMeters,
+    );
   }
 
   Future<void> _speakCurrentGuidance() async {
@@ -1452,11 +1528,14 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         _steeringError = null;
         _distanceToDestinationMeters = null;
         _distanceToNextPointMeters = null;
+        _routeDeviationMeters = null;
+        _currentRouteToleranceMeters = null;
         _recognizedDestinationText = '';
         _speechStatus = '안내가 중지되었습니다.';
       });
     }
 
+    _resetMotorCommandCache();
     await _sendBleLine('S:0');
     await _speak('길 안내를 중지합니다.');
 
@@ -1483,10 +1562,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         _steeringError = null;
         _distanceToNextPointMeters = null;
         _distanceToDestinationMeters = 0;
+        _routeDeviationMeters = null;
+        _currentRouteToleranceMeters = null;
         _speechStatus = '목적지에 도착했습니다.';
       });
     }
 
+    _resetMotorCommandCache();
     await _sendBleLine('S:0');
     await _speak('목적지에 도착했습니다. 안내를 종료합니다.');
   }
@@ -1500,6 +1582,10 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
     if (stream == null) return;
 
+    // Android 나침반(자북 기준)을 TMAP 경로와 같은 진북 기준으로 맞춘다.
+    final double declination =
+        Platform.isAndroid ? magneticDeclinationDegrees : 0.0;
+
     _compassSubscription = stream.listen(
       (CompassEvent event) {
         final double? raw = event.heading;
@@ -1508,38 +1594,141 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
           return;
         }
 
-        final double heading = (raw + 360.0) % 360.0;
+        // 걸을 때 흔들리는 값을 그대로 쓰지 않고 평활화한 값을 사용한다.
+        final double heading = _smoothCompassHeading(
+          (raw + declination + 360.0) % 360.0,
+        );
 
         setState(() {
           _phoneHeading = heading;
         });
 
-        if (_isNavigationActive &&
-            _targetBearing != null &&
-            !_isCrosswalkMode &&
-            !_obstacleConfirmed) {
-          final double error = _signedAngleDifference(
-            _targetBearing!,
-            heading,
-          );
-
-          final String command = _motorCommandForAngle(error);
-
-          unawaited(
-            _sendMotorCommandToCaneIfNeeded(
-              command,
-              angle: error.abs(),
-            ),
-          );
-
-          if (mounted) {
-            setState(() {
-              _steeringError = error;
-            });
-          }
-        }
+        unawaited(_updateSteering());
       },
     );
+  }
+
+  // 지수 이동 평균으로 나침반 값을 부드럽게 만든다.
+  // 이벤트 간격에 맞춰 가중치를 정하므로 기기마다 나침반 주기가 달라도
+  // 반응 속도는 compassSmoothingSeconds로 같다.
+  double _smoothCompassHeading(double rawHeading) {
+    final DateTime now = DateTime.now();
+    final double rawRad = _degreeToRadian(rawHeading);
+    final double rawSin = math.sin(rawRad);
+    final double rawCos = math.cos(rawRad);
+
+    final DateTime? lastEventAt = _lastCompassEventAt;
+
+    if (lastEventAt == null) {
+      _headingSin = rawSin;
+      _headingCos = rawCos;
+    } else {
+      final double dtSeconds = math.max(
+        0.0,
+        now.difference(lastEventAt).inMicroseconds / 1000000.0,
+      );
+      final double alpha =
+          1.0 - math.exp(-dtSeconds / compassSmoothingSeconds);
+
+      _headingSin += (rawSin - _headingSin) * alpha;
+      _headingCos += (rawCos - _headingCos) * alpha;
+    }
+
+    _lastCompassEventAt = now;
+
+    return (_radianToDegree(math.atan2(_headingSin, _headingCos)) + 360.0) %
+        360.0;
+  }
+
+  // 목표 방위각과 나침반 방위각의 오차로 직진/좌/우를 정해 ESP32로 보낸다.
+  // 나침반 이벤트(Android 기준 초당 약 30회)와 GPS 갱신 양쪽에서 호출된다.
+  Future<void> _updateSteering() async {
+    final double? targetBearing = _targetBearing;
+    final double? heading = _phoneHeading;
+
+    if (!mounted ||
+        !_isNavigationActive ||
+        targetBearing == null ||
+        heading == null) {
+      return;
+    }
+
+    final double error = _signedAngleDifference(
+      targetBearing,
+      heading,
+    );
+
+    // 횡단보도(Raspberry Pi) 또는 장애물 회피(ESP32) 중에는 화면 값만 갱신
+    final bool canSteer = !_isCrosswalkMode && !_obstacleConfirmed;
+
+    if (canSteer) {
+      _updateSteeringCommand(error);
+    }
+
+    setState(() {
+      _steeringError = error;
+    });
+
+    if (canSteer) {
+      await _sendMotorCommandToCaneIfNeeded(
+        _steeringCommand,
+        angle: error.abs(),
+      );
+    }
+  }
+
+  // 히스테리시스 + 유지 시간으로 직진/좌/우 판단이 자주 바뀌지 않게 한다.
+  void _updateSteeringCommand(double steeringError) {
+    final String candidate = _steeringCandidate(steeringError);
+
+    if (candidate == _steeringCommand) {
+      _pendingSteeringCommand = null;
+      _pendingSteeringSince = null;
+      return;
+    }
+
+    // 지금 유도 중인 방향과 다른 판단이 나오면 우선 바로 직진(유도 중지)으로.
+    _steeringCommand = 'F';
+
+    if (candidate == 'F') {
+      _pendingSteeringCommand = null;
+      _pendingSteeringSince = null;
+      return;
+    }
+
+    // 좌/우는 같은 판단이 steeringHoldDuration 동안 이어질 때만 반영한다.
+    final DateTime now = DateTime.now();
+    final DateTime? pendingSince = _pendingSteeringSince;
+
+    if (candidate != _pendingSteeringCommand || pendingSince == null) {
+      _pendingSteeringCommand = candidate;
+      _pendingSteeringSince = now;
+      return;
+    }
+
+    if (now.difference(pendingSince) >= steeringHoldDuration) {
+      _steeringCommand = candidate;
+      _pendingSteeringCommand = null;
+      _pendingSteeringSince = null;
+    }
+  }
+
+  String _steeringCandidate(double steeringError) {
+    // 이미 같은 방향으로 유도 중이면 더 작은 오차(headingReleaseDegrees)까지
+    // 그 방향을 유지
+    if (_steeringCommand == 'R' && steeringError > headingReleaseDegrees) {
+      return 'R';
+    }
+
+    if (_steeringCommand == 'L' && steeringError < -headingReleaseDegrees) {
+      return 'L';
+    }
+
+    // 직진 중에는 오차가 headingToleranceDegrees를 넘어야 좌/우로 판단
+    if (steeringError > headingToleranceDegrees) return 'R';
+    if (steeringError < -headingToleranceDegrees) return 'L';
+
+    return 'F';
   }
 
   double _calculateTargetBearing({
@@ -1592,21 +1781,25 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     return radian * 180.0 / math.pi;
   }
 
-  String _motorCommandForAngle(double steeringError) {
-    if (steeringError.abs() <= headingToleranceDegrees) {
-      return 'F';
-    }
-
-    return steeringError > 0 ? 'R' : 'L';
+  // 화면에는 실제로 지팡이에 보내고 있는 방향을 표시한다.
+  String _directionText() {
+    if (!_isNavigationActive) return '안내 대기';
+    if (_isCrosswalkMode) return '횡단보도 제어 중';
+    if (_obstacleConfirmed) return '장애물 회피 중';
+    if (_steeringError == null) return '나침반 준비 중';
+    if (_steeringCommand == 'R') return '오른쪽';
+    if (_steeringCommand == 'L') return '왼쪽';
+    return '직진';
   }
 
-  String _directionText() {
-    final double? error = _steeringError;
+  String _routeDeviationText() {
+    final double? deviation = _routeDeviationMeters;
+    final double? tolerance = _currentRouteToleranceMeters;
 
-    if (!_isNavigationActive) return '안내 대기';
-    if (error == null) return '나침반 준비 중';
-    if (error.abs() <= headingToleranceDegrees) return '직진';
-    return error > 0 ? '오른쪽' : '왼쪽';
+    if (deviation == null || tolerance == null) return '--';
+
+    return '${deviation.toStringAsFixed(1)} m '
+        '(허용 ${tolerance.toStringAsFixed(0)} m)';
   }
 
   String _headingText() {
@@ -1973,22 +2166,18 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       final bool commandChanged =
           command != _lastMotorCommand;
 
-      final bool angleChanged =
-          _lastMotorAngle == null ||
-          (angle - _lastMotorAngle!).abs() >= 5.0;
-
+      // 같은 명령은 motorRepeatInterval마다 한 번만 다시 보낸다.
+      // 나침반이 조금 흔들릴 때마다 L/R을 연달아 보내지 않도록
+      // 각도 변화만으로는 다시 보내지 않는다.
       final bool enoughTime =
           _lastMotorSentAt == null ||
-          now.difference(_lastMotorSentAt!).inMilliseconds >= 700;
+          now.difference(_lastMotorSentAt!) >= motorRepeatInterval;
 
-      if (!commandChanged &&
-          !angleChanged &&
-          !enoughTime) {
+      if (!commandChanged && !enoughTime) {
         return;
       }
 
       _lastMotorCommand = command;
-      _lastMotorAngle = angle;
       _lastMotorSentAt = now;
 
       await _sendBleLine(
@@ -2426,8 +2615,12 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
   void _resetMotorCommandCache() {
     _lastMotorCommand = null;
-    _lastMotorAngle = null;
     _lastMotorSentAt = null;
+
+    // 모드가 바뀌면 좌/우 판단도 직진부터 다시 시작한다.
+    _steeringCommand = 'F';
+    _pendingSteeringCommand = null;
+    _pendingSteeringSince = null;
   }
 
   Future<void> _speakCrosswalkDetectedOnce() async {
@@ -2788,6 +2981,20 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
                   Row(
                     children: [
                       const Expanded(
+                        child: Text('경로선과 거리'),
+                      ),
+                      Text(
+                        _routeDeviationText(),
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      const Expanded(
                         child: Text('다음 경로점'),
                       ),
                       Text(
@@ -3115,3 +3322,6 @@ class _RouteProjection {
   final double distanceMeters;
   final int segmentIndex;
 }
+
+// 현재 위치를 원점으로 하는 평면 좌표(m). x: 동쪽, y: 북쪽
+typedef _LocalMeters = ({double x, double y});
