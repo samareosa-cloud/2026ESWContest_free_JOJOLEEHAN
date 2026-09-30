@@ -119,21 +119,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   // iOS(flutter_compass)는 이미 진북(trueHeading)을 주므로 Android에서만 적용한다.
   static const double magneticDeclinationDegrees = -9.0;
 
-  // ===========================================================================
-  // 횡단보도 시연 (Raspberry Pi 없이 ESP32 + Flutter만 사용)
-  // ===========================================================================
-  // 횡단보도 앞에서 저장한 "건널 방향"을 건너는 동안 나침반으로 유지시킨다.
-  // 횡단보도는 짧고 벗어나면 위험하므로 일반 길안내보다 민감하게 잡는다.
-  static const double crossingHeadingToleranceDegrees = 12.0;
-  static const double crossingHeadingReleaseDegrees = 5.0;
-  static const Duration crossingHoldDuration = Duration(milliseconds: 300);
-  static const Duration crossingMotorRepeatInterval =
-      Duration(milliseconds: 800);
-
-  // 시연용 초록불 시간(초). 남은 시간이 crossingWarnSeconds가 되면 음성 경고.
-  static const int crossingGreenSeconds = 20;
-  static const int crossingWarnSeconds = 5;
-
   // 장애물을 피한 직후에는 잠깐 방향 유도를 쉬어서
   // 바로 장애물 쪽으로 다시 끌어당기지 않게 한다.
   static const Duration obstacleClearPause = Duration(milliseconds: 2500);
@@ -233,13 +218,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   String _avoidDirection = 'NONE';
   DateTime? _obstacleClearedAt;
 
-  // 횡단보도 시연 단계
-  // NONE: 시연 안 함 / WAIT: 빨간불 대기 / CROSS: 초록불 횡단 중
-  String _crossingDemoPhase = 'NONE';
-  double? _crossingHeading;
-  int _greenRemainingSeconds = 0;
-  Timer? _greenTimer;
-
   // ===========================================================================
   // 거리 센서 / Raspberry Pi 인식 결과
   // ===========================================================================
@@ -289,7 +267,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
     _guidanceTimer?.cancel();
     _listenRetryTimer?.cancel();
-    _greenTimer?.cancel();
 
     _speech.cancel();
     _tts.stop();
@@ -581,18 +558,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       return;
     }
 
-    // 횡단보도 시연 음성 명령
-    if (_crossingDemoPhase != 'NONE' &&
-        _containsAny(command, ['건넜', '도착', '완료'])) {
-      await _finishCrossingDemo();
-      return;
-    }
-
-    if (_crossingDemoPhase == 'NONE' && command.contains('횡단보도')) {
-      await _startCrossingDemo();
-      return;
-    }
-
     // 길 안내 중 음성 명령
     if (_containsAny(command, ['중지', '취소', '그만', '종료', '멈춰'])) {
       await _stopNavigationByUser();
@@ -660,7 +625,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
   Future<void> _retryDestinationInput(String guideMessage) async {
     if (!mounted ||
-        _crossingDemoPhase != 'NONE' ||
         _isNavigationActive ||
         _isSearchingRoute ||
         _isSpeaking ||
@@ -1618,154 +1582,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   }
 
   // ===========================================================================
-  // 횡단보도 시연 (Raspberry Pi 없이 ESP32 + Flutter만 사용)
-  //
-  // 1. 횡단보도 앞에서 건널 방향으로 지팡이를 향하고 "횡단보도 앞 도착"
-  //    → 지금 나침반 방향을 "건널 방향"으로 저장, 빨간불 대기
-  // 2. 신호 버튼(시연자가 신호등에 맞춰 누름)
-  //    → 빨간불/초록불 음성 안내 (음향신호기가 없는 횡단보도 보완)
-  // 3. 초록불 동안 저장한 방향에서 틀어지면 ESP32 모터로 바로잡음
-  //    → 건너다가 방향이 틀어지는 문제 보완
-  // 4. "건너기 완료" 또는 음성 "다 건넜어" → 종료
-  // ===========================================================================
-
-  Future<void> _startCrossingDemo() async {
-    final double? heading = _phoneHeading;
-
-    if (heading == null) {
-      await _speak('나침반 값을 읽을 수 없습니다.');
-      return;
-    }
-
-    _greenTimer?.cancel();
-    _listenRetryTimer?.cancel();
-
-    if (mounted) {
-      setState(() {
-        _crossingDemoPhase = 'WAIT';
-        _crossingHeading = heading;
-        _crosswalkDetected = true;
-        _trafficLight = 'RED';
-        _greenRemainingSeconds = 0;
-        _steeringError = null;
-      });
-    }
-
-    _resetMotorCommandCache();
-    await _sendBleLine('S:0');
-
-    _enqueueSystemSpeech(
-      '횡단보도 앞입니다. 건널 방향을 저장했습니다. '
-      '빨간불입니다. 기다려 주세요.',
-    );
-  }
-
-  void _setCrossingDemoSignal(String light) {
-    if (_crossingDemoPhase == 'NONE') return;
-
-    if (light == 'GREEN') {
-      if (_crossingDemoPhase == 'CROSS' && _trafficLight == 'GREEN') return;
-
-      setState(() {
-        _crossingDemoPhase = 'CROSS';
-        _trafficLight = 'GREEN';
-        _greenRemainingSeconds = crossingGreenSeconds;
-      });
-
-      _resetMotorCommandCache();
-      _enqueueSystemSpeech('초록불입니다. 앞으로 건너세요.');
-
-      _greenTimer?.cancel();
-      _greenTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (!mounted || _crossingDemoPhase != 'CROSS') {
-          _greenTimer?.cancel();
-          return;
-        }
-
-        final int remaining = _greenRemainingSeconds - 1;
-
-        if (remaining <= 0) {
-          _setCrossingDemoSignal('RED');
-          return;
-        }
-
-        setState(() {
-          _greenRemainingSeconds = remaining;
-        });
-
-        if (remaining == crossingWarnSeconds) {
-          _enqueueSystemSpeech('신호가 $crossingWarnSeconds초 남았습니다.');
-        }
-      });
-
-      return;
-    }
-
-    // 빨간불
-    _greenTimer?.cancel();
-
-    if (_trafficLight == 'RED') return;
-
-    if (_crossingDemoPhase == 'CROSS') {
-      // 건너는 도중 빨간불: 한가운데서 멈추면 더 위험하므로
-      // 방향 유지는 계속하면서 빨리 끝까지 건너도록 안내한다.
-      setState(() {
-        _trafficLight = 'RED';
-        _greenRemainingSeconds = 0;
-      });
-
-      _enqueueSystemSpeech('신호가 바뀌었습니다. 멈추지 말고 끝까지 건너세요.');
-      return;
-    }
-
-    setState(() {
-      _trafficLight = 'RED';
-      _greenRemainingSeconds = 0;
-    });
-
-    _enqueueSystemSpeech('빨간불입니다. 기다려 주세요.');
-  }
-
-  Future<void> _finishCrossingDemo() async {
-    if (_crossingDemoPhase == 'NONE') return;
-
-    final bool crossed = _crossingDemoPhase == 'CROSS';
-
-    _greenTimer?.cancel();
-
-    if (mounted) {
-      setState(() {
-        _crossingDemoPhase = 'NONE';
-        _crossingHeading = null;
-        _crosswalkDetected = false;
-        _trafficLight = 'NONE';
-        _greenRemainingSeconds = 0;
-        _steeringError = null;
-      });
-    }
-
-    _resetMotorCommandCache();
-    await _sendBleLine('S:0');
-
-    _enqueueSystemSpeech(
-      crossed ? '횡단보도를 다 건넜습니다.' : '횡단보도 시연을 종료합니다.',
-    );
-  }
-
-  String _crossingDemoStatusText() {
-    switch (_crossingDemoPhase) {
-      case 'WAIT':
-        return '빨간불 대기 중';
-      case 'CROSS':
-        return _trafficLight == 'GREEN'
-            ? '초록불 횡단 중 · 남은 시간 $_greenRemainingSeconds초'
-            : '신호 바뀜 · 끝까지 건너는 중';
-      default:
-        return '건널 방향으로 지팡이를 향한 뒤 시작하세요';
-    }
-  }
-
-  // ===========================================================================
   // 스마트폰 나침반 / 방위각
   // ===========================================================================
 
@@ -1835,17 +1651,11 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   // 목표 방위각과 나침반 방위각의 오차로 직진/좌/우를 정해 ESP32로 보낸다.
   // 나침반 이벤트(Android 기준 초당 약 30회)와 GPS 갱신 양쪽에서 호출된다.
   Future<void> _updateSteering() async {
-    // 횡단보도 시연 중 빨간불 대기: 지팡이는 멈춰 있어야 하므로 유도하지 않음
-    if (_crossingDemoPhase == 'WAIT') return;
-
-    // 횡단 중에는 길안내 목표 대신 횡단보도 앞에서 저장한 방향을 유지한다.
-    final bool crossing = _crossingDemoPhase == 'CROSS';
-    final double? targetBearing =
-        crossing ? _crossingHeading : _targetBearing;
+    final double? targetBearing = _targetBearing;
     final double? heading = _phoneHeading;
 
     if (!mounted ||
-        (!crossing && !_isNavigationActive) ||
+        !_isNavigationActive ||
         targetBearing == null ||
         heading == null) {
       return;
@@ -1866,17 +1676,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         !_isCrosswalkMode && !_obstacleConfirmed && !justAvoidedObstacle;
 
     if (canSteer) {
-      _updateSteeringCommand(
-        error,
-        toleranceDegrees: crossing
-            ? crossingHeadingToleranceDegrees
-            : headingToleranceDegrees,
-        releaseDegrees: crossing
-            ? crossingHeadingReleaseDegrees
-            : headingReleaseDegrees,
-        holdDuration:
-            crossing ? crossingHoldDuration : steeringHoldDuration,
-      );
+      _updateSteeringCommand(error);
     }
 
     setState(() {
@@ -1887,24 +1687,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       await _sendMotorCommandToCaneIfNeeded(
         _steeringCommand,
         angle: error.abs(),
-        repeatInterval:
-            crossing ? crossingMotorRepeatInterval : motorRepeatInterval,
       );
     }
   }
 
   // 히스테리시스 + 유지 시간으로 직진/좌/우 판단이 자주 바뀌지 않게 한다.
-  void _updateSteeringCommand(
-    double steeringError, {
-    required double toleranceDegrees,
-    required double releaseDegrees,
-    required Duration holdDuration,
-  }) {
-    final String candidate = _steeringCandidate(
-      steeringError,
-      toleranceDegrees: toleranceDegrees,
-      releaseDegrees: releaseDegrees,
-    );
+  void _updateSteeringCommand(double steeringError) {
+    final String candidate = _steeringCandidate(steeringError);
 
     if (candidate == _steeringCommand) {
       _pendingSteeringCommand = null;
@@ -1921,7 +1710,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       return;
     }
 
-    // 좌/우는 같은 판단이 holdDuration 동안 이어질 때만 반영한다.
+    // 좌/우는 같은 판단이 steeringHoldDuration 동안 이어질 때만 반영한다.
     final DateTime now = DateTime.now();
     final DateTime? pendingSince = _pendingSteeringSince;
 
@@ -1931,31 +1720,27 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       return;
     }
 
-    if (now.difference(pendingSince) >= holdDuration) {
+    if (now.difference(pendingSince) >= steeringHoldDuration) {
       _steeringCommand = candidate;
       _pendingSteeringCommand = null;
       _pendingSteeringSince = null;
     }
   }
 
-  String _steeringCandidate(
-    double steeringError, {
-    required double toleranceDegrees,
-    required double releaseDegrees,
-  }) {
-    // 이미 같은 방향으로 유도 중이면 더 작은 오차(releaseDegrees)까지
+  String _steeringCandidate(double steeringError) {
+    // 이미 같은 방향으로 유도 중이면 더 작은 오차(headingReleaseDegrees)까지
     // 그 방향을 유지
-    if (_steeringCommand == 'R' && steeringError > releaseDegrees) {
+    if (_steeringCommand == 'R' && steeringError > headingReleaseDegrees) {
       return 'R';
     }
 
-    if (_steeringCommand == 'L' && steeringError < -releaseDegrees) {
+    if (_steeringCommand == 'L' && steeringError < -headingReleaseDegrees) {
       return 'L';
     }
 
-    // 직진 중에는 오차가 toleranceDegrees를 넘어야 좌/우로 판단
-    if (steeringError > toleranceDegrees) return 'R';
-    if (steeringError < -toleranceDegrees) return 'L';
+    // 직진 중에는 오차가 headingToleranceDegrees를 넘어야 좌/우로 판단
+    if (steeringError > headingToleranceDegrees) return 'R';
+    if (steeringError < -headingToleranceDegrees) return 'L';
 
     return 'F';
   }
@@ -2012,17 +1797,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
   // 화면에는 실제로 지팡이에 보내고 있는 방향을 표시한다.
   String _directionText() {
-    if (_crossingDemoPhase == 'WAIT') return '빨간불 대기';
-    if (_crossingDemoPhase == 'NONE' && !_isNavigationActive) return '안내 대기';
+    if (!_isNavigationActive) return '안내 대기';
     if (_isCrosswalkMode) return '횡단보도 제어 중';
     if (_obstacleConfirmed) return '장애물 회피 중';
     if (_steeringError == null) return '나침반 준비 중';
-
-    final String prefix = _crossingDemoPhase == 'CROSS' ? '횡단 중 · ' : '';
-
-    if (_steeringCommand == 'R') return '$prefix오른쪽';
-    if (_steeringCommand == 'L') return '$prefix왼쪽';
-    return '$prefix직진';
+    if (_steeringCommand == 'R') return '오른쪽';
+    if (_steeringCommand == 'L') return '왼쪽';
+    return '직진';
   }
 
   String _routeDeviationText() {
@@ -2381,7 +2162,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   Future<void> _sendMotorCommandToCaneIfNeeded(
       String command, {
       required double angle,
-      Duration repeatInterval = motorRepeatInterval,
     }) async {
       if (!_isBleConnected) return;
 
@@ -2401,12 +2181,12 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       final bool commandChanged =
           command != _lastMotorCommand;
 
-      // 같은 명령은 repeatInterval마다 한 번만 다시 보낸다.
+      // 같은 명령은 motorRepeatInterval마다 한 번만 다시 보낸다.
       // 나침반이 조금 흔들릴 때마다 L/R을 연달아 보내지 않도록
       // 각도 변화만으로는 다시 보내지 않는다.
       final bool enoughTime =
           _lastMotorSentAt == null ||
-          now.difference(_lastMotorSentAt!) >= repeatInterval;
+          now.difference(_lastMotorSentAt!) >= motorRepeatInterval;
 
       if (!commandChanged && !enoughTime) {
         return;
@@ -3157,84 +2937,6 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
                       onPressed: _stopNavigationByUser,
                       icon: const Icon(Icons.stop),
                       label: const Text('안내 중지'),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-
-            // -----------------------------------------------------------------
-            // 횡단보도 시연 (ESP32 + Flutter)
-            // -----------------------------------------------------------------
-            _sectionCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const Text(
-                    '횡단보도 시연',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    _crossingDemoStatusText(),
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: _crossingDemoPhase == 'NONE'
-                          ? Colors.grey.shade700
-                          : _trafficLightColor(),
-                    ),
-                  ),
-                  if (_crossingDemoPhase != 'NONE') ...[
-                    const SizedBox(height: 6),
-                    Text(
-                      '건널 방향 '
-                      '${_crossingHeading?.toStringAsFixed(0) ?? '--'}°'
-                      '  ·  방향 오차 '
-                      '${_steeringError == null ? '--' : '${_steeringError!.toStringAsFixed(0)}°'}',
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                  const SizedBox(height: 10),
-                  if (_crossingDemoPhase == 'NONE')
-                    FilledButton.icon(
-                      onPressed: _startCrossingDemo,
-                      icon: const Icon(Icons.directions_walk),
-                      label: const Text('횡단보도 앞 도착 (방향 저장)'),
-                    )
-                  else ...[
-                    Row(
-                      children: [
-                        Expanded(
-                          child: FilledButton(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: Colors.red,
-                            ),
-                            onPressed: () => _setCrossingDemoSignal('RED'),
-                            child: const Text('빨간불'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: FilledButton(
-                            style: FilledButton.styleFrom(
-                              backgroundColor: Colors.green,
-                            ),
-                            onPressed: () => _setCrossingDemoSignal('GREEN'),
-                            child: const Text('초록불'),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _finishCrossingDemo,
-                      icon: const Icon(Icons.flag),
-                      label: const Text('건너기 완료'),
                     ),
                   ],
                 ],
