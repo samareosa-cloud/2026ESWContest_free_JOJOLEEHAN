@@ -122,6 +122,39 @@ bool obstacleTriggered = false;
 
 
 // =====================================================
+// 장애물 회피 유도
+//
+// 역토크 후 고른 방향(좌/우)으로, 정면이 트일 때
+// (TFmini RESET_DISTANCE 이상)까지 계속 당겨 준다.
+// 예전에는 250ms 한 번만 당기고 끝나서, 정면이 여전히
+// 막혀 있어도 아무 동작을 하지 않았다.
+// =====================================================
+
+const int AVOID_PWM = 70;           // 일반 유도(55)보다 조금 강하게
+const int AVOID_PULSE_TIME = 400;   // 한 번 당기는 시간 (ms)
+const int AVOID_REPEAT_MS = 900;    // 당김 시작 간격 (ms)
+const int AVOID_MAX_PULSES = 8;     // 이만큼 당겨도 정면이 막혀 있으면 "길 막힘"
+
+enum AvoidState {
+  AVOID_NONE,
+  AVOID_LEFT,
+  AVOID_RIGHT,
+  AVOID_BLOCKED
+};
+
+AvoidState avoidState = AVOID_NONE;
+
+int avoidPulseCount = 0;
+unsigned long lastAvoidPulseAt = 0;
+unsigned long avoidPulseEndAt = 0;
+bool avoidPulseRunning = false;
+
+// loop에서 300ms마다 갱신되는 최근 좌/우 거리 (cm, 실패 시 -1)
+int lastLeftDistance = -1;
+int lastRightDistance = -1;
+
+
+// =====================================================
 // 방향 유도 모터 설정
 // =====================================================
 
@@ -555,50 +588,124 @@ void obstacleWarning() {
 
 
 // =====================================================
-// 장애물 회피용 LEFT 유도
+// 장애물 회피용 당김 (non-blocking)
 //
-// 기존 guideLeft()는 obstacleTriggered=true일 때 무시하므로,
-// 장애물 회피 전용 함수는 별도로 둔다.
-// 오른쪽 바퀴 M2를 짧게 구동해서 왼쪽으로 유도.
+// 기존 guideLeft()/guideRight()는 obstacleTriggered=true일 때
+// 무시하므로 회피 전용 함수를 따로 둔다.
+// delay()로 기다리지 않고 끝나는 시각만 기록해서,
+// 당기는 동안에도 TFmini/BLE 처리가 계속 돌게 한다.
+//
+// LEFT : 오른쪽 바퀴 M2 구동
+// RIGHT: 왼쪽 바퀴 M1 구동
 // =====================================================
 
-void avoidLeft() {
+void startAvoidPulse(AvoidState side) {
 
-  Serial.println("[AVOID] TURN LEFT");
+  bool left = side == AVOID_LEFT;
 
-  ledcWrite(M1_PWM, 0);
+  Serial.print("[AVOID] PULL ");
+  Serial.print(left ? "LEFT" : "RIGHT");
+  Serial.print(" #");
+  Serial.println(avoidPulseCount + 1);
 
-  digitalWrite(M2_DIR, LOW);
-  ledcWrite(M2_PWM, GUIDE_PWM);
+  if (left) {
+    ledcWrite(M1_PWM, 0);
+    digitalWrite(M2_DIR, LOW);
+    ledcWrite(M2_PWM, AVOID_PWM);
+  }
+  else {
+    ledcWrite(M2_PWM, 0);
+    digitalWrite(M1_DIR, LOW);
+    ledcWrite(M1_PWM, AVOID_PWM);
+  }
 
-  delay(GUIDE_TIME);
+  avoidPulseRunning = true;
+  lastAvoidPulseAt = millis();
+  avoidPulseEndAt = lastAvoidPulseAt + AVOID_PULSE_TIME;
+  avoidPulseCount++;
 
-  ledcWrite(M2_PWM, 0);
+  sendBLE(left ? "MOTOR:L" : "MOTOR:R");
+}
 
-  sendBLE("MOTOR:L");
+
+// 당기는 시간이 끝났으면 모터를 끈다. loop에서 매번 호출.
+void updateAvoidPulse() {
+
+  if (
+    avoidPulseRunning
+    &&
+    (long)(millis() - avoidPulseEndAt) >= 0
+  ) {
+
+    stopMotors();
+    avoidPulseRunning = false;
+  }
 }
 
 
 // =====================================================
-// 장애물 회피용 RIGHT 유도
+// 회피 방향 고르기
 //
-// 왼쪽 바퀴 M1을 짧게 구동해서 오른쪽으로 유도.
+// - 30cm 미만(또는 읽기 실패)인 쪽은 막힌 것으로 본다.
+// - 양쪽 다 막힘 -> BLOCKED
+// - 이미 피하던 쪽이 아직 열려 있으면 유지 (좌우 왔다갔다 방지)
+// - 한쪽만 열림 -> 그쪽
+// - 둘 다 열림 -> 20cm 넘게 더 넓은 쪽, 비슷하면 오른쪽(우측 보행)
 // =====================================================
 
-void avoidRight() {
+AvoidState chooseAvoidSide(int leftDistance, int rightDistance) {
 
-  Serial.println("[AVOID] TURN RIGHT");
+  bool leftOpen = leftDistance >= SIDE_BLOCK_DISTANCE;
+  bool rightOpen = rightDistance >= SIDE_BLOCK_DISTANCE;
 
-  ledcWrite(M2_PWM, 0);
+  if (!leftOpen && !rightOpen) {
+    return AVOID_BLOCKED;
+  }
 
-  digitalWrite(M1_DIR, LOW);
-  ledcWrite(M1_PWM, GUIDE_PWM);
+  if (avoidState == AVOID_LEFT && leftOpen) {
+    return AVOID_LEFT;
+  }
 
-  delay(GUIDE_TIME);
+  if (avoidState == AVOID_RIGHT && rightOpen) {
+    return AVOID_RIGHT;
+  }
 
-  ledcWrite(M1_PWM, 0);
+  if (leftOpen && !rightOpen) {
+    return AVOID_LEFT;
+  }
 
-  sendBLE("MOTOR:R");
+  if (rightOpen && !leftOpen) {
+    return AVOID_RIGHT;
+  }
+
+  if (leftDistance > rightDistance + DIRECTION_MARGIN) {
+    return AVOID_LEFT;
+  }
+
+  return AVOID_RIGHT;
+}
+
+
+// 회피 상태가 바뀔 때만 앱에 알린다. (앱이 음성으로 안내)
+void setAvoidState(AvoidState next) {
+
+  if (next == avoidState) {
+    return;
+  }
+
+  avoidState = next;
+
+  if (next == AVOID_LEFT) {
+    sendBLE("AVOID:L");
+  }
+  else if (next == AVOID_RIGHT) {
+    sendBLE("AVOID:R");
+  }
+  else if (next == AVOID_BLOCKED) {
+    stopMotors();
+    avoidPulseRunning = false;
+    sendBLE("AVOID:BLOCKED");
+  }
 }
 
 
@@ -721,12 +828,12 @@ int readVL53Right() {
 
 
 // =====================================================
-// 장애물 회피 방향 결정
+// 장애물 확정 시 1회 실행
 //
-// 1) 양쪽 모두 30cm 미만 -> 회피 공간 없음 -> 역토크 경고
-// 2) LEFT가 RIGHT보다 20cm 초과 더 멂 -> LEFT 유도
-// 3) RIGHT가 LEFT보다 20cm 초과 더 멂 -> RIGHT 유도
-// 4) 차이가 20cm 이하 -> 별도 좌/우 유도 없이 정지
+// 1) 역토크 3회로 멈춤 알림
+// 2) 좌/우 VL53L1X로 회피 방향 결정 (chooseAvoidSide)
+// 3) 그 방향으로 첫 당김 시작
+//    -> 이후 updateObstacleAvoidance()가 정면이 트일 때까지 반복
 // =====================================================
 
 void handleObstacleAvoidance(int frontDistance) {
@@ -752,6 +859,9 @@ void handleObstacleAvoidance(int frontDistance) {
   // 역토크 직후 잠깐 안정화
   delay(100);
 
+  // 역토크 동안 쌓인 옛날 거리 데이터 버리기
+  flushTFmini();
+
 
   // ===================================================
   // 2. 좌우 VL53L1X 거리 측정
@@ -776,73 +886,96 @@ void handleObstacleAvoidance(int frontDistance) {
   Serial.println(" cm");
 
 
-  // 센서 하나라도 읽기 실패하면 방향 유도하지 않고 정지
-  // 역토크는 위에서 이미 실행했으므로 다시 실행하지 않음.
-  if (
-    leftDistance < 0
-    ||
-    rightDistance < 0
-  ) {
+  lastLeftDistance = leftDistance;
+  lastRightDistance = rightDistance;
 
-    Serial.println("[AVOID] VL53 read error -> STOP");
-    stopMotors();
-    return;
-  }
+  avoidPulseCount = 0;
+  avoidPulseRunning = false;
+  avoidState = AVOID_NONE;
 
+  AvoidState side = chooseAvoidSide(leftDistance, rightDistance);
 
-  // 양쪽 모두 막혀 있으면 정지
-  // 역토크는 위에서 이미 실행됨.
-  if (
-    leftDistance < SIDE_BLOCK_DISTANCE
-    &&
-    rightDistance < SIDE_BLOCK_DISTANCE
-  ) {
+  setAvoidState(side);
 
+  if (side == AVOID_BLOCKED) {
+    // 양쪽 다 막힘 (또는 센서 읽기 실패). 역토크는 이미 실행됨.
     Serial.println("[AVOID] BOTH SIDES BLOCKED -> STOP");
-    stopMotors();
     return;
   }
 
+  startAvoidPulse(side);
+}
 
-  // 왼쪽이 확실히 더 넓음
+
+// =====================================================
+// 장애물 회피 중 반복 (loop에서 obstacleTriggered일 때 매번 호출)
+//
+// 정면이 아직 막혀 있으면 AVOID_REPEAT_MS마다 다시 당긴다.
+// 당길 때마다 좌/우를 다시 확인해서, 피하던 쪽이 막히면
+// 반대쪽으로 바꾸고 둘 다 막히면 멈춘다.
+// AVOID_MAX_PULSES번 당겨도 정면이 안 트이면 "길 막힘"으로
+// 역토크를 한 번 더 주고 멈춘다.
+// =====================================================
+
+void updateObstacleAvoidance() {
+
+  updateAvoidPulse();
+
   if (
-    leftDistance >
-        rightDistance + DIRECTION_MARGIN
+    avoidState != AVOID_LEFT
+    &&
+    avoidState != AVOID_RIGHT
+  ) {
+    return;
+  }
+
+  if (avoidPulseRunning) {
+    return;
+  }
+
+  if (millis() - lastAvoidPulseAt < (unsigned long)AVOID_REPEAT_MS) {
+    return;
+  }
+
+  if (avoidPulseCount >= AVOID_MAX_PULSES) {
+
+    Serial.println("[AVOID] front still blocked -> BLOCKED");
+
+    setAvoidState(AVOID_BLOCKED);
+
+    obstacleWarning();
+    flushTFmini();
+
+    return;
+  }
+
+  AvoidState side =
+      chooseAvoidSide(lastLeftDistance, lastRightDistance);
+
+  setAvoidState(side);
+
+  if (
+    side == AVOID_LEFT
+    ||
+    side == AVOID_RIGHT
   ) {
 
-    avoidLeft();
-    return;
+    startAvoidPulse(side);
   }
-
-
-  // 오른쪽이 확실히 더 넓음
-  if (
-    rightDistance >
-        leftDistance + DIRECTION_MARGIN
-  ) {
-
-    avoidRight();
-    return;
-  }
-
-
-  // 좌우 차이가 기준 이하이면 확실한 회피 방향이 아니므로 중립
-  stopMotors();
-
-  Serial.println(
-    "[AVOID] LEFT/RIGHT difference <= 20 cm -> NEUTRAL"
-  );
 }
 
 
 // =====================================================
 // TFmini 읽기
+//
+// 버퍼에 쌓인 프레임을 모두 읽고 "가장 최근" 거리를 돌려준다.
+// 역토크처럼 delay()가 긴 동작 뒤에는 옛날 프레임이 쌓여 있어서,
+// 첫 프레임만 읽으면 이미 지난 거리로 판단하게 된다.
 // =====================================================
 
 int readTFmini() {
 
-  static uint8_t buf[9];
-
+  int latest = -1;
 
   while (
     TFSerial.available() >= 9
@@ -856,40 +989,27 @@ int readTFmini() {
     }
 
 
-    // 두 번째 헤더
+    // 두 번째 헤더 (아니면 버리지 않고 다음 바이트부터 다시 찾음)
     if (
-      TFSerial.read() != 0x59
+      TFSerial.peek() != 0x59
     ) {
       continue;
     }
 
+    TFSerial.read();
+
+
+    uint8_t buf[9];
 
     buf[0] = 0x59;
     buf[1] = 0x59;
 
-
+    // available() >= 9 였으므로 나머지 7바이트는 이미 들어와 있음
     for (
       int i = 2;
       i < 9;
       i++
     ) {
-
-      unsigned long start =
-          millis();
-
-
-      while (
-        !TFSerial.available()
-      ) {
-
-        if (
-          millis() - start > 10
-        ) {
-
-          return -1;
-        }
-      }
-
 
       buf[i] =
           TFSerial.read();
@@ -898,7 +1018,6 @@ int readTFmini() {
 
     // checksum
     uint16_t checksum = 0;
-
 
     for (
       int i = 0;
@@ -909,7 +1028,6 @@ int readTFmini() {
       checksum +=
           buf[i];
     }
-
 
     checksum &=
         0xFF;
@@ -923,21 +1041,30 @@ int readTFmini() {
         "[TFmini] checksum error"
       );
 
-      return -1;
+      continue;
     }
 
 
     // 거리 cm
-    uint16_t distance =
+    latest =
         buf[2] |
         (buf[3] << 8);
-
-
-    return distance;
   }
 
 
-  return -1;
+  return latest;
+}
+
+
+// 긴 동작(역토크 등) 뒤에 쌓인 옛날 TFmini 데이터를 버린다.
+void flushTFmini() {
+
+  while (
+    TFSerial.available()
+  ) {
+
+    TFSerial.read();
+  }
 }
 
 
@@ -1728,7 +1855,11 @@ void setup() {
   );
 
   Serial.println(
-    " both side < 30 cm : stop after reverse torque"
+    " then pull toward open side until front >= 40 cm"
+  );
+
+  Serial.println(
+    " both side < 30 cm or still blocked : stop"
   );
 
   Serial.println();
@@ -1763,6 +1894,9 @@ void loop() {
     int leftDistance = readVL53Left();
     int rightDistance = readVL53Right();
 
+    lastLeftDistance = leftDistance;
+    lastRightDistance = rightDistance;
+
     Serial.print("[VL53] LEFT=");
     Serial.print(leftDistance);
     Serial.print(" cm | RIGHT=");
@@ -1778,6 +1912,15 @@ void loop() {
     );
 
     lastSideDistanceSend = millis();
+  }
+
+
+  // =================================================
+  // 장애물 회피 중이면 정면이 트일 때까지 계속 유도
+  // =================================================
+
+  if (obstacleTriggered) {
+    updateObstacleAvoidance();
   }
 
 
@@ -1928,6 +2071,12 @@ void loop() {
 
       obstacleCount =
           0;
+
+      // 회피 유도 종료
+      stopMotors();
+      avoidPulseRunning = false;
+      avoidPulseCount = 0;
+      avoidState = AVOID_NONE;
 
 
       sendBLE(
