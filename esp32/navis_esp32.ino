@@ -2,6 +2,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Wire.h>
+#include <VL53L1X.h>
 
 
 // =====================================================
@@ -26,6 +28,34 @@
 #define TF_TX 17
 
 HardwareSerial TFSerial(2);
+
+
+// =====================================================
+// VL53L1X LEFT / RIGHT
+//
+// 두 센서는 기본 I2C 주소가 0x29로 같기 때문에
+// XSHUT으로 하나씩 켜서 주소를 바꿔 사용한다.
+//
+// LEFT  XSHUT -> GPIO23, address 0x30
+// RIGHT XSHUT -> GPIO26, address 0x31
+// SDA -> GPIO21 (공유)
+// SCL -> GPIO22 (공유)
+// =====================================================
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+#define VL_LEFT_XSHUT 23
+#define VL_RIGHT_XSHUT 26
+
+#define VL_LEFT_ADDR 0x30
+#define VL_RIGHT_ADDR 0x31
+
+VL53L1X vlLeft;
+VL53L1X vlRight;
+
+bool vlLeftOK = false;
+bool vlRightOK = false;
 
 
 // =====================================================
@@ -79,6 +109,15 @@ bool bleConnected = false;
 const int OBSTACLE_DISTANCE = 30;
 const int RESET_DISTANCE = 40;
 
+// 저번 장애물 회피 로직
+// TFmini 30cm 이하가 3회 연속 들어와야 실제 장애물로 판단
+const int OBSTACLE_CONFIRM_COUNT = 3;
+
+// 좌/우 VL53L1X 판단 기준
+const int SIDE_BLOCK_DISTANCE = 30;
+const int DIRECTION_MARGIN = 20;
+
+int obstacleCount = 0;
 bool obstacleTriggered = false;
 
 
@@ -94,7 +133,7 @@ const int GUIDE_TIME = 250;
 // 역토크 설정
 // =====================================================
 
-const int BRAKE_PWM = 33;
+const int BRAKE_PWM = 45;
 
 const int BRAKE_ON_TIME = 300;
 const int BRAKE_OFF_TIME = 200;
@@ -511,6 +550,287 @@ void obstacleWarning() {
 
   Serial.println(
     "*** BRAKE END ***"
+  );
+}
+
+
+// =====================================================
+// 장애물 회피용 LEFT 유도
+//
+// 기존 guideLeft()는 obstacleTriggered=true일 때 무시하므로,
+// 장애물 회피 전용 함수는 별도로 둔다.
+// 오른쪽 바퀴 M2를 짧게 구동해서 왼쪽으로 유도.
+// =====================================================
+
+void avoidLeft() {
+
+  Serial.println("[AVOID] TURN LEFT");
+
+  ledcWrite(M1_PWM, 0);
+
+  digitalWrite(M2_DIR, LOW);
+  ledcWrite(M2_PWM, GUIDE_PWM);
+
+  delay(GUIDE_TIME);
+
+  ledcWrite(M2_PWM, 0);
+
+  sendBLE("MOTOR:L");
+}
+
+
+// =====================================================
+// 장애물 회피용 RIGHT 유도
+//
+// 왼쪽 바퀴 M1을 짧게 구동해서 오른쪽으로 유도.
+// =====================================================
+
+void avoidRight() {
+
+  Serial.println("[AVOID] TURN RIGHT");
+
+  ledcWrite(M2_PWM, 0);
+
+  digitalWrite(M1_DIR, LOW);
+  ledcWrite(M1_PWM, GUIDE_PWM);
+
+  delay(GUIDE_TIME);
+
+  ledcWrite(M1_PWM, 0);
+
+  sendBLE("MOTOR:R");
+}
+
+
+// =====================================================
+// VL53L1X 2개 초기화
+// =====================================================
+
+void setupVL53L1X() {
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  pinMode(VL_LEFT_XSHUT, OUTPUT);
+  pinMode(VL_RIGHT_XSHUT, OUTPUT);
+
+  // 둘 다 끄기
+  digitalWrite(VL_LEFT_XSHUT, LOW);
+  digitalWrite(VL_RIGHT_XSHUT, LOW);
+
+  delay(20);
+
+  // -------------------------------------------------
+  // LEFT 먼저 켜고 0x30으로 주소 변경
+  // -------------------------------------------------
+  digitalWrite(VL_LEFT_XSHUT, HIGH);
+  delay(20);
+
+  vlLeft.setTimeout(100);
+
+  if (vlLeft.init()) {
+
+    vlLeft.setAddress(VL_LEFT_ADDR);
+    vlLeft.setDistanceMode(VL53L1X::Long);
+    vlLeft.setMeasurementTimingBudget(50000);
+    vlLeft.startContinuous(50);
+
+    vlLeftOK = true;
+
+    Serial.println("[OK] VL53L1X LEFT  addr=0x30");
+  }
+  else {
+
+    vlLeftOK = false;
+
+    Serial.println("[ERROR] VL53L1X LEFT init failed");
+  }
+
+
+  // -------------------------------------------------
+  // RIGHT 켜고 기본주소 0x29에서 0x31로 변경
+  // -------------------------------------------------
+  digitalWrite(VL_RIGHT_XSHUT, HIGH);
+  delay(20);
+
+  vlRight.setTimeout(100);
+
+  if (vlRight.init()) {
+
+    vlRight.setAddress(VL_RIGHT_ADDR);
+    vlRight.setDistanceMode(VL53L1X::Long);
+    vlRight.setMeasurementTimingBudget(50000);
+    vlRight.startContinuous(50);
+
+    vlRightOK = true;
+
+    Serial.println("[OK] VL53L1X RIGHT addr=0x31");
+  }
+  else {
+
+    vlRightOK = false;
+
+    Serial.println("[ERROR] VL53L1X RIGHT init failed");
+  }
+}
+
+
+// =====================================================
+// VL53L1X LEFT 거리 읽기 (cm)
+// =====================================================
+
+int readVL53Left() {
+
+  if (!vlLeftOK) {
+    return -1;
+  }
+
+  uint16_t mm = vlLeft.read();
+
+  if (vlLeft.timeoutOccurred()) {
+
+    Serial.println("[VL53 LEFT] timeout");
+
+    return -1;
+  }
+
+  return mm / 10;
+}
+
+
+// =====================================================
+// VL53L1X RIGHT 거리 읽기 (cm)
+// =====================================================
+
+int readVL53Right() {
+
+  if (!vlRightOK) {
+    return -1;
+  }
+
+  uint16_t mm = vlRight.read();
+
+  if (vlRight.timeoutOccurred()) {
+
+    Serial.println("[VL53 RIGHT] timeout");
+
+    return -1;
+  }
+
+  return mm / 10;
+}
+
+
+// =====================================================
+// 장애물 회피 방향 결정
+//
+// 1) 양쪽 모두 30cm 미만 -> 회피 공간 없음 -> 역토크 경고
+// 2) LEFT가 RIGHT보다 20cm 초과 더 멂 -> LEFT 유도
+// 3) RIGHT가 LEFT보다 20cm 초과 더 멂 -> RIGHT 유도
+// 4) 차이가 20cm 이하 -> 별도 좌/우 유도 없이 정지
+// =====================================================
+
+void handleObstacleAvoidance(int frontDistance) {
+
+  // ===================================================
+  // 1. 정면 장애물 확정 후 역토크 3회 먼저 실행
+  // ===================================================
+  stopMotors();
+
+  Serial.println();
+  Serial.println("[AVOID] FRONT OBSTACLE CONFIRMED -> BRAKE FIRST");
+
+  // Flutter 앱에 장애물 음성 안내 요청.
+  // 장애물 1건당 역토크 시작 직전에 딱 한 번만 전송한다.
+  sendBLE("OBSTACLE_BRAKE");
+
+  // BLE Notify가 앱으로 전달될 시간을 아주 짧게 확보.
+  delay(50);
+
+  // 역토크 3회
+  obstacleWarning();
+
+  // 역토크 직후 잠깐 안정화
+  delay(100);
+
+
+  // ===================================================
+  // 2. 좌우 VL53L1X 거리 측정
+  // ===================================================
+  int leftDistance = readVL53Left();
+  int rightDistance = readVL53Right();
+
+
+  Serial.println();
+  Serial.println("========== OBSTACLE AVOID ==========");
+
+  Serial.print("FRONT = ");
+  Serial.print(frontDistance);
+  Serial.println(" cm");
+
+  Serial.print("LEFT  = ");
+  Serial.print(leftDistance);
+  Serial.println(" cm");
+
+  Serial.print("RIGHT = ");
+  Serial.print(rightDistance);
+  Serial.println(" cm");
+
+
+  // 센서 하나라도 읽기 실패하면 방향 유도하지 않고 정지
+  // 역토크는 위에서 이미 실행했으므로 다시 실행하지 않음.
+  if (
+    leftDistance < 0
+    ||
+    rightDistance < 0
+  ) {
+
+    Serial.println("[AVOID] VL53 read error -> STOP");
+    stopMotors();
+    return;
+  }
+
+
+  // 양쪽 모두 막혀 있으면 정지
+  // 역토크는 위에서 이미 실행됨.
+  if (
+    leftDistance < SIDE_BLOCK_DISTANCE
+    &&
+    rightDistance < SIDE_BLOCK_DISTANCE
+  ) {
+
+    Serial.println("[AVOID] BOTH SIDES BLOCKED -> STOP");
+    stopMotors();
+    return;
+  }
+
+
+  // 왼쪽이 확실히 더 넓음
+  if (
+    leftDistance >
+        rightDistance + DIRECTION_MARGIN
+  ) {
+
+    avoidLeft();
+    return;
+  }
+
+
+  // 오른쪽이 확실히 더 넓음
+  if (
+    rightDistance >
+        leftDistance + DIRECTION_MARGIN
+  ) {
+
+    avoidRight();
+    return;
+  }
+
+
+  // 좌우 차이가 기준 이하이면 확실한 회피 방향이 아니므로 중립
+  stopMotors();
+
+  Serial.println(
+    "[AVOID] LEFT/RIGHT difference <= 20 cm -> NEUTRAL"
   );
 }
 
@@ -1280,6 +1600,13 @@ void setup() {
 
 
   // =================================================
+  // VL53L1X LEFT / RIGHT
+  // =================================================
+
+  setupVL53L1X();
+
+
+  // =================================================
   // Raspberry Pi UART
   // =================================================
 
@@ -1397,7 +1724,11 @@ void setup() {
   );
 
   Serial.println(
-    " <= 30 cm  : reverse torque x3"
+    " <= 30 cm x3 : voice alert + reverse torque x3 + compare LEFT/RIGHT"
+  );
+
+  Serial.println(
+    " both side < 30 cm : stop after reverse torque"
   );
 
   Serial.println();
@@ -1415,6 +1746,39 @@ void loop() {
   // =================================================
 
   readRaspberryPi();
+
+
+  // =================================================
+  // LEFT / RIGHT VL53L1X 거리 -> Flutter
+  // 300 ms마다 SIDE:왼쪽cm,오른쪽cm 전송
+  // 예: SIDE:82,135
+  // =================================================
+
+  static unsigned long lastSideDistanceSend = 0;
+
+  if (
+    millis() - lastSideDistanceSend >= 300
+  ) {
+
+    int leftDistance = readVL53Left();
+    int rightDistance = readVL53Right();
+
+    Serial.print("[VL53] LEFT=");
+    Serial.print(leftDistance);
+    Serial.print(" cm | RIGHT=");
+    Serial.print(rightDistance);
+    Serial.println(" cm");
+
+    // 읽기 실패 시 -1이 전송되고, Flutter에서는 -- cm로 표시
+    sendBLE(
+      "SIDE:"
+      + String(leftDistance)
+      + ","
+      + String(rightDistance)
+    );
+
+    lastSideDistanceSend = millis();
+  }
 
 
   // =================================================
@@ -1485,14 +1849,48 @@ void loop() {
 
 
     // -------------------------------------------------
-    // 30cm 이하
-    //
-    // 역토크는 한 장애물당 한 번만
+    // TFmini 30cm 이하가 3회 연속 들어오면
+    // LEFT / RIGHT VL53L1X를 비교해서 회피 방향 결정
     // -------------------------------------------------
 
     if (
       distance <=
           OBSTACLE_DISTANCE
+    ) {
+
+      if (
+        obstacleCount <
+            OBSTACLE_CONFIRM_COUNT
+      ) {
+
+        obstacleCount++;
+
+        Serial.print(
+          "[OBSTACLE COUNT] "
+        );
+
+        Serial.print(
+          obstacleCount
+        );
+
+        Serial.print(
+          "/"
+        );
+
+        Serial.println(
+          OBSTACLE_CONFIRM_COUNT
+        );
+      }
+    }
+    else {
+
+      obstacleCount = 0;
+    }
+
+
+    if (
+      obstacleCount >=
+          OBSTACLE_CONFIRM_COUNT
       &&
       !obstacleTriggered
     ) {
@@ -1508,15 +1906,14 @@ void loop() {
       );
 
 
-      stopMotors();
-
-
-      obstacleWarning();
+      handleObstacleAvoidance(
+        distance
+      );
     }
 
 
     // -------------------------------------------------
-    // 40cm 이상으로 다시 멀어지면 reset
+    // 정면이 40cm 이상으로 다시 멀어지면 reset
     // -------------------------------------------------
 
     if (
@@ -1528,6 +1925,9 @@ void loop() {
 
       obstacleTriggered =
           false;
+
+      obstacleCount =
+          0;
 
 
       sendBLE(
