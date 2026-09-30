@@ -186,6 +186,28 @@ bool trafficRed = false;
 
 
 // =====================================================
+// 횡단 중 방향 보정 (Raspberry Pi CROSS_MOTOR:L/R/CENTER)
+//
+// Pi는 건너는 동안 현재 보정 방향을 0.3초마다 계속 보낸다.
+// ESP32는 받은 방향을 "상태"로 기억하고, CENTER가 오거나
+// 방향이 바뀔 때까지 CROSS_REPEAT_MS마다 계속 당긴다.
+// 안전장치: CROSS_TIMEOUT_MS 동안 Pi 소식이 없으면 스스로 멈춘다.
+// =====================================================
+
+const int CROSS_PWM = 60;
+const int CROSS_PULSE_TIME = 300;    // 한 번 당기는 시간 (ms)
+const int CROSS_REPEAT_MS = 600;     // 당김 시작 간격 (ms)
+const int CROSS_TIMEOUT_MS = 1000;   // Pi 메시지 끊김 판단 (ms)
+
+char crossSteer = 'C';               // 'L' / 'R' / 'C'
+unsigned long lastCrossMsgAt = 0;
+unsigned long lastCrossPulseAt = 0;
+unsigned long crossPulseEndAt = 0;
+bool crossPulseRunning = false;
+bool crossPulseStartNow = false;
+
+
+// =====================================================
 // Flutter에서 받은 목표 방위각
 //
 // 현재는 로그 확인용.
@@ -408,81 +430,154 @@ void guideForward() {
 }
 
 // =====================================================
-// 횡단보도 LEFT 보정
-// Raspberry Pi -> CROSS_MOTOR:L
+// 횡단보도 보정 상태 변경
+// Raspberry Pi -> CROSS_MOTOR:L / R / CENTER
+//
+// 여기서는 상태만 바꾸고, 실제 당김은 updateCrosswalkSteering()이
+// loop에서 반복한다. 앱에는 방향이 바뀔 때만 알린다.
 // =====================================================
+
+void setCrossSteer(char dir) {
+
+  lastCrossMsgAt = millis();
+
+  if (dir == crossSteer) {
+    return;
+  }
+
+  crossSteer = dir;
+
+  // 당기던 중이면 끊고, 새 방향은 바로 한 번 당긴다.
+  if (crossPulseRunning && !obstacleTriggered) {
+    stopMotors();
+  }
+
+  crossPulseRunning = false;
+  crossPulseStartNow = true;
+
+  Serial.print("[CROSS MOTOR] ");
+  Serial.println(dir);
+
+  if (dir == 'L') {
+    sendBLE("CROSS_MOTOR:L");
+  }
+  else if (dir == 'R') {
+    sendBLE("CROSS_MOTOR:R");
+  }
+  else {
+    sendBLE("CROSS_MOTOR:CENTER");
+  }
+}
+
+
+// 횡단 보정 멈춤 (장애물 회피 중이면 그 모터 동작은 건드리지 않음)
+void stopCrossSteer() {
+
+  crossSteer = 'C';
+
+  if (!obstacleTriggered) {
+    stopMotors();
+  }
+
+  crossPulseRunning = false;
+}
+
+
 void crosswalkLeft() {
-
-  if (
-    !crosswalkMode ||
-    trafficRed ||
-    obstacleTriggered
-  ) {
-    stopMotors();
-    return;
-  }
-
-  Serial.println("[CROSS MOTOR] LEFT");
-
-  // M1 정지
-  ledcWrite(M1_PWM, 0);
-
-  // M2를 이용해 왼쪽 유도
-  digitalWrite(M2_DIR, LOW);
-  ledcWrite(M2_PWM, GUIDE_PWM);
-
-  delay(GUIDE_TIME);
-
-  ledcWrite(M2_PWM, 0);
-
-  sendBLE("CROSS_MOTOR:L");
+  setCrossSteer('L');
 }
 
 
-// =====================================================
-// 횡단보도 RIGHT 보정
-// Raspberry Pi -> CROSS_MOTOR:R
-// =====================================================
 void crosswalkRight() {
+  setCrossSteer('R');
+}
 
+
+void crosswalkCenter() {
+  setCrossSteer('C');
+}
+
+
+// =====================================================
+// 횡단 보정 반복 (loop에서 매번 호출)
+// =====================================================
+
+void updateCrosswalkSteering() {
+
+  unsigned long now = millis();
+
+  // 당기는 시간이 끝났으면 끄기
   if (
-    !crosswalkMode ||
-    trafficRed ||
-    obstacleTriggered
+    crossPulseRunning
+    &&
+    (long)(now - crossPulseEndAt) >= 0
   ) {
-    stopMotors();
+
+    if (!obstacleTriggered) {
+      stopMotors();
+    }
+
+    crossPulseRunning = false;
+  }
+
+  // 장애물 회피가 최우선
+  if (obstacleTriggered) {
+    crossPulseRunning = false;
     return;
   }
 
-  Serial.println("[CROSS MOTOR] RIGHT");
+  if (
+    !crosswalkMode
+    ||
+    trafficRed
+    ||
+    (crossSteer != 'L' && crossSteer != 'R')
+  ) {
+    return;
+  }
 
-  // M2 정지
-  ledcWrite(M2_PWM, 0);
+  // Pi 메시지가 끊기면 멈춤 (Pi 멈춤 / 케이블 빠짐 대비)
+  if (now - lastCrossMsgAt > (unsigned long)CROSS_TIMEOUT_MS) {
 
-  // M1을 이용해 오른쪽 유도
-  digitalWrite(M1_DIR, LOW);
-  ledcWrite(M1_PWM, GUIDE_PWM);
+    Serial.println("[CROSS MOTOR] Pi timeout -> CENTER");
 
-  delay(GUIDE_TIME);
+    stopCrossSteer();
+    sendBLE("CROSS_MOTOR:CENTER");
+    return;
+  }
 
-  ledcWrite(M1_PWM, 0);
+  if (crossPulseRunning) {
+    return;
+  }
 
-  sendBLE("CROSS_MOTOR:R");
+  if (
+    !crossPulseStartNow
+    &&
+    now - lastCrossPulseAt < (unsigned long)CROSS_REPEAT_MS
+  ) {
+    return;
+  }
+
+  crossPulseStartNow = false;
+
+  if (crossSteer == 'L') {
+    // 오른쪽 바퀴 M2로 왼쪽 유도
+    ledcWrite(M1_PWM, 0);
+    digitalWrite(M2_DIR, LOW);
+    ledcWrite(M2_PWM, CROSS_PWM);
+  }
+  else {
+    // 왼쪽 바퀴 M1로 오른쪽 유도
+    ledcWrite(M2_PWM, 0);
+    digitalWrite(M1_DIR, LOW);
+    ledcWrite(M1_PWM, CROSS_PWM);
+  }
+
+  crossPulseRunning = true;
+  lastCrossPulseAt = now;
+  crossPulseEndAt = now + CROSS_PULSE_TIME;
 }
 
-
-// =====================================================
-// 횡단보도 중앙 유지
-// Raspberry Pi -> CROSS_MOTOR:CENTER
-// =====================================================
-void crosswalkCenter() {
-
-  stopMotors();
-
-  Serial.println("[CROSS MOTOR] CENTER");
-
-  sendBLE("CROSS_MOTOR:CENTER");
-}
 
 // =====================================================
 // 장애물 역토크 3회
@@ -1071,14 +1166,18 @@ void flushTFmini() {
 // =====================================================
 // Raspberry Pi 메시지 처리
 //
-// Raspberry Pi에서 아래처럼 보내면 됨.
+// Raspberry Pi에서 아래처럼 보내면 됨. (docs/PROTOCOL.md)
 //
 // CROSSWALK:1
 // CROSSWALK:0
 //
 // LIGHT:RED
 // LIGHT:GREEN
+// LIGHT:GREEN_WAIT
 // LIGHT:NONE
+//
+// CROSSING_START / CROSSING_END
+// CROSS_MOTOR:L / CROSS_MOTOR:R / CROSS_MOTOR:CENTER  (0.3초마다 반복)
 //
 // 각 메시지 뒤에는 반드시 \n
 // =====================================================
@@ -1117,7 +1216,7 @@ void handlePiMessage(
 
     crosswalkMode = true;
 
-    stopMotors();
+    stopCrossSteer();
 
 
     sendBLE(
@@ -1140,7 +1239,7 @@ void handlePiMessage(
     crosswalkMode = false;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
 
     sendBLE(
@@ -1164,7 +1263,7 @@ void handlePiMessage(
     crosswalkMode = true;
     trafficRed = true;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "LIGHT:RED"
@@ -1186,10 +1285,31 @@ void handlePiMessage(
     crosswalkMode = true;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "LIGHT:GREEN"
+    );
+
+    return;
+  }
+
+
+  // -------------------------------------------------
+  // 초록불이 이미 켜져 있음 (빨간불을 못 봄)
+  // 남은 시간을 모르므로 건너지 않고 다음 신호를 기다린다.
+  // -------------------------------------------------
+  if (
+    message == "LIGHT:GREEN_WAIT"
+  ) {
+
+    crosswalkMode = true;
+    trafficRed = true;
+
+    stopCrossSteer();
+
+    sendBLE(
+      "LIGHT:GREEN_WAIT"
     );
 
     return;
@@ -1221,7 +1341,7 @@ void handlePiMessage(
     crosswalkMode = true;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "CROSSING_START"
@@ -1280,7 +1400,7 @@ void handlePiMessage(
     crosswalkMode = false;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "CROSSING_END"
@@ -1922,6 +2042,13 @@ void loop() {
   if (obstacleTriggered) {
     updateObstacleAvoidance();
   }
+
+
+  // =================================================
+  // 횡단 중이면 Pi 보정 방향으로 계속 유도
+  // =================================================
+
+  updateCrosswalkSteering();
 
 
   // =================================================

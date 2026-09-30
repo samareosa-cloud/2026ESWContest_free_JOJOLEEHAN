@@ -2775,6 +2775,41 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     }
 
     // ============================================================
+    // 7-1. 초록불이 이미 켜져 있음 (Raspberry Pi가 빨간불을 못 봄)
+    //
+    // LIGHT:GREEN_WAIT
+    // 남은 시간을 모르므로 건너지 않고 다음 신호를 기다린다.
+    // ============================================================
+    if (message == 'LIGHT:GREEN_WAIT') {
+      final String oldLight = _trafficLight;
+      final bool oldCrosswalk = _crosswalkDetected;
+
+      if (mounted) {
+        setState(() {
+          _crosswalkDetected = true;
+          _isCrosswalkMode = true;
+          _trafficLight = 'GREEN_WAIT';
+        });
+      }
+
+      _resetMotorCommandCache();
+
+      if (!oldCrosswalk) {
+        _enqueueSystemSpeech('앞에 횡단보도가 있습니다.');
+      }
+
+      if (oldLight != 'GREEN_WAIT') {
+        _enqueueSystemSpeech(
+          '초록불이 이미 켜져 있습니다. 다음 초록불에 건너겠습니다. 기다려 주세요.',
+        );
+      }
+
+      debugPrint('[TRAFFIC] GREEN_WAIT');
+
+      return;
+    }
+
+    // ============================================================
     // 8. 신호등 미인식
     //
     // LIGHT:NONE
@@ -2815,6 +2850,10 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     // 다시 Flutter 일반 TMAP 유도로 복귀
     // ============================================================
     if (message == 'CROSSING_END') {
+      if (_crosswalkDetected) {
+        _enqueueSystemSpeech('횡단보도를 다 건넜습니다.');
+      }
+
       if (mounted) {
         setState(() {
           _isCrosswalkMode = false;
@@ -2950,12 +2989,17 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       return '초록불 인식함';
     }
 
+    if (_trafficLight == 'GREEN_WAIT') {
+      return '초록불 진행 중 · 다음 신호 대기';
+    }
+
     return '신호등 대기 중';
   }
 
   Color _trafficLightColor() {
     if (_trafficLight == 'RED') return Colors.red;
     if (_trafficLight == 'GREEN') return Colors.green;
+    if (_trafficLight == 'GREEN_WAIT') return Colors.orange;
     return Colors.grey;
   }
 
