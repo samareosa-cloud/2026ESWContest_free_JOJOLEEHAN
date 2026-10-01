@@ -117,6 +117,11 @@ const int OBSTACLE_CONFIRM_COUNT = 3;
 const int SIDE_BLOCK_DISTANCE = 30;
 const int DIRECTION_MARGIN = 20;
 
+// 한쪽 센서가 고장(-1)이고 반대쪽이 막혔을 때 고장난 쪽으로 유도할지.
+// true : 시연용. 사용자가 지팡이를 잡고 걷고, 정면 TFmini가 계속 감시한다.
+// false: 고장난 쪽은 막힌 것으로 보고 멈춤(AVOID:BLOCKED).
+const bool SIDE_FAIL_AS_OPEN = true;
+
 int obstacleCount = 0;
 bool obstacleTriggered = false;
 
@@ -756,6 +761,8 @@ void updateAvoidPulse() {
 // 회피 방향 고르기
 //
 // - 30cm 미만(또는 읽기 실패)인 쪽은 막힌 것으로 본다.
+//   단, 한쪽만 고장이고 반대쪽이 막혔으면 고장난 쪽으로 (SIDE_FAIL_AS_OPEN)
+// - 반사 없음(앞이 멀리 트임)은 400cm로 읽혀 열린 쪽이다.
 // - 양쪽 다 막힘 -> BLOCKED
 // - 이미 피하던 쪽이 아직 열려 있으면 유지 (좌우 왔다갔다 방지)
 // - 한쪽만 열림 -> 그쪽
@@ -764,8 +771,22 @@ void updateAvoidPulse() {
 
 AvoidState chooseAvoidSide(int leftDistance, int rightDistance) {
 
+  bool leftFailed = leftDistance < 0;
+  bool rightFailed = rightDistance < 0;
+
   bool leftOpen = leftDistance >= SIDE_BLOCK_DISTANCE;
   bool rightOpen = rightDistance >= SIDE_BLOCK_DISTANCE;
+
+  // 한쪽 센서만 고장: 다른 쪽이 막혔으면 고장난 쪽으로 유도한다.
+  // (예전엔 왼쪽이 -1이면 오른쪽 장애물 때 BLOCKED로 멈춰 버림)
+  // 다른 쪽이 열려 있으면 값을 아는 쪽이 우선이다.
+  if (SIDE_FAIL_AS_OPEN && leftFailed && !rightFailed && !rightOpen) {
+    leftOpen = true;
+  }
+
+  if (SIDE_FAIL_AS_OPEN && rightFailed && !leftFailed && !leftOpen) {
+    rightOpen = true;
+  }
 
   if (!leftOpen && !rightOpen) {
     return AVOID_BLOCKED;
@@ -820,7 +841,143 @@ void setAvoidState(AvoidState next) {
 
 // =====================================================
 // VL53L1X 2개 초기화
+//
+// 예전 코드는 부팅할 때 한 번만 시도해서, 왼쪽 센서가
+// 한 번 실패하면 전원을 끌 때까지 계속 -1(읽기 실패)이었다.
+//
+// - 센서마다 최대 3번 XSHUT 껐다 켜며 다시 시도
+// - EN 버튼 리셋 때 XSHUT 선이 헐거우면 센서가 이미
+//   0x30/0x31 주소로 남아 있을 수 있어서 그 주소로도 시도
+// - 그래도 실패하면 그 센서 XSHUT을 LOW로 꺼 둔다
+//   (0x29로 남아 다른 센서와 주소가 겹치는 것 방지)
+// - 동작 중에도 실패한 센서는 3초마다 다시 살린다
 // =====================================================
+
+// 센서 앞이 멀리 트여서 반사가 없을 때 쓸 값 (cm)
+// VL53L1X는 이때 0 같은 값 + SignalFail 상태를 준다.
+// 예전 코드는 이 0을 "30cm 미만 = 막힘"으로 봤다.
+const int SIDE_OPEN_DISTANCE = 400;
+
+// 읽기 연속 실패가 이만큼 쌓이면 센서를 다시 초기화
+const int VL53_FAIL_LIMIT = 5;
+const unsigned long VL53_RETRY_MS = 3000;
+
+int vlLeftFailCount = 0;
+int vlRightFailCount = 0;
+
+
+bool i2cDevicePresent(uint8_t address) {
+
+  Wire.beginTransmission(address);
+
+  return Wire.endTransmission() == 0;
+}
+
+
+void printI2CScan() {
+
+  Serial.print("[I2C] found:");
+
+  bool any = false;
+
+  for (uint8_t address = 1; address < 127; address++) {
+
+    if (i2cDevicePresent(address)) {
+
+      Serial.print(" 0x");
+      Serial.print(address, HEX);
+
+      any = true;
+    }
+  }
+
+  if (!any) {
+    Serial.print(" (none) -> SDA/SCL/VCC/GND 배선 확인");
+  }
+
+  Serial.println();
+}
+
+
+void startVL53(VL53L1X& sensor) {
+
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(50000);
+  sensor.startContinuous(50);
+}
+
+
+bool initVL53(
+  VL53L1X& sensor,
+  int xshutPin,
+  uint8_t newAddress,
+  const char* name
+) {
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+
+    // 이 센서만 껐다 켜서 기본 주소 0x29로 되돌린다
+    digitalWrite(xshutPin, LOW);
+    delay(10);
+    digitalWrite(xshutPin, HIGH);
+    delay(20);
+
+    sensor = VL53L1X();   // 주소 정보를 0x29로 초기화
+    sensor.setTimeout(100);
+
+    if (sensor.init()) {
+
+      sensor.setAddress(newAddress);
+      startVL53(sensor);
+
+      Serial.print("[OK] VL53L1X ");
+      Serial.print(name);
+      Serial.print(" addr=0x");
+      Serial.print(newAddress, HEX);
+      Serial.print(" (try ");
+      Serial.print(attempt);
+      Serial.println(")");
+
+      return true;
+    }
+
+    // XSHUT이 안 먹어서 이미 새 주소에 남아 있는 경우
+    if (i2cDevicePresent(newAddress)) {
+
+      sensor = VL53L1X();
+      sensor.setTimeout(100);
+      sensor.setAddress(newAddress);  // 0x29엔 아무도 없으니 주소 정보만 바뀜
+
+      if (sensor.init()) {
+
+        startVL53(sensor);
+
+        Serial.print("[OK] VL53L1X ");
+        Serial.print(name);
+        Serial.println(" (이미 새 주소에 있었음 -> XSHUT 선 확인)");
+
+        return true;
+      }
+    }
+
+    Serial.print("[RETRY] VL53L1X ");
+    Serial.print(name);
+    Serial.print(" init failed, try ");
+    Serial.println(attempt);
+
+    delay(30);
+  }
+
+  // 실패한 센서는 꺼 둔다 (0x29 주소 충돌 방지)
+  digitalWrite(xshutPin, LOW);
+
+  Serial.print("[ERROR] VL53L1X ");
+  Serial.print(name);
+  Serial.println(" init failed -> 배선(VCC/GND/SDA/SCL/XSHUT) 확인");
+
+  return false;
+}
+
 
 void setupVL53L1X() {
 
@@ -835,104 +992,107 @@ void setupVL53L1X() {
 
   delay(20);
 
-  // -------------------------------------------------
-  // LEFT 먼저 켜고 0x30으로 주소 변경
-  // -------------------------------------------------
-  digitalWrite(VL_LEFT_XSHUT, HIGH);
-  delay(20);
+  // 꺼 둔 상태에서 무엇이 보이는지 (보이면 XSHUT 선이 안 먹는 것)
+  printI2CScan();
 
-  vlLeft.setTimeout(100);
+  // LEFT 먼저 0x30, 그다음 RIGHT 0x31
+  // (오른쪽은 꺼진 상태라 0x29 충돌 없음)
+  vlLeftOK = initVL53(vlLeft, VL_LEFT_XSHUT, VL_LEFT_ADDR, "LEFT ");
+  vlRightOK = initVL53(vlRight, VL_RIGHT_XSHUT, VL_RIGHT_ADDR, "RIGHT");
 
-  if (vlLeft.init()) {
+  printI2CScan();
 
-    vlLeft.setAddress(VL_LEFT_ADDR);
-    vlLeft.setDistanceMode(VL53L1X::Long);
-    vlLeft.setMeasurementTimingBudget(50000);
-    vlLeft.startContinuous(50);
+  vlLeftFailCount = 0;
+  vlRightFailCount = 0;
+}
 
-    vlLeftOK = true;
 
-    Serial.println("[OK] VL53L1X LEFT  addr=0x30");
+// 동작 중 실패한 센서 다시 살리기 (loop에서 호출)
+void maintainVL53L1X() {
+
+  static unsigned long lastRetry = 0;
+
+  bool leftBad = !vlLeftOK || vlLeftFailCount >= VL53_FAIL_LIMIT;
+  bool rightBad = !vlRightOK || vlRightFailCount >= VL53_FAIL_LIMIT;
+
+  if (!leftBad && !rightBad) {
+    return;
+  }
+
+  // 회피 중에는 초기화(수백 ms)로 루프를 막지 않는다
+  if (obstacleTriggered) {
+    return;
+  }
+
+  if (millis() - lastRetry < VL53_RETRY_MS) {
+    return;
+  }
+
+  lastRetry = millis();
+
+  // 한 번에 한 센서만. 다른 센서는 0x30/0x31에 있으니 0x29 충돌 없음
+  if (leftBad) {
+
+    vlLeftOK = initVL53(vlLeft, VL_LEFT_XSHUT, VL_LEFT_ADDR, "LEFT ");
+    vlLeftFailCount = 0;
   }
   else {
 
-    vlLeftOK = false;
-
-    Serial.println("[ERROR] VL53L1X LEFT init failed");
-  }
-
-
-  // -------------------------------------------------
-  // RIGHT 켜고 기본주소 0x29에서 0x31로 변경
-  // -------------------------------------------------
-  digitalWrite(VL_RIGHT_XSHUT, HIGH);
-  delay(20);
-
-  vlRight.setTimeout(100);
-
-  if (vlRight.init()) {
-
-    vlRight.setAddress(VL_RIGHT_ADDR);
-    vlRight.setDistanceMode(VL53L1X::Long);
-    vlRight.setMeasurementTimingBudget(50000);
-    vlRight.startContinuous(50);
-
-    vlRightOK = true;
-
-    Serial.println("[OK] VL53L1X RIGHT addr=0x31");
-  }
-  else {
-
-    vlRightOK = false;
-
-    Serial.println("[ERROR] VL53L1X RIGHT init failed");
+    vlRightOK = initVL53(vlRight, VL_RIGHT_XSHUT, VL_RIGHT_ADDR, "RIGHT");
+    vlRightFailCount = 0;
   }
 }
 
 
 // =====================================================
-// VL53L1X LEFT 거리 읽기 (cm)
+// VL53L1X 거리 읽기 (cm)
+//
+// -1  : 센서 고장/응답 없음
+// 400 : 반사 없음 (앞이 멀리 트임) -> 열린 쪽으로 본다
 // =====================================================
+
+int readVL53(VL53L1X& sensor, bool ok, int& failCount, const char* name) {
+
+  if (!ok) {
+    return -1;
+  }
+
+  uint16_t mm = sensor.read();
+
+  if (sensor.timeoutOccurred()) {
+
+    failCount++;
+
+    Serial.print("[VL53 ");
+    Serial.print(name);
+    Serial.println("] timeout");
+
+    return -1;
+  }
+
+  failCount = 0;
+
+  VL53L1X::RangeStatus status = sensor.ranging_data.range_status;
+
+  if (
+    status == VL53L1X::SignalFail
+    ||
+    status == VL53L1X::OutOfBoundsFail
+  ) {
+    return SIDE_OPEN_DISTANCE;
+  }
+
+  return mm / 10;
+}
+
 
 int readVL53Left() {
-
-  if (!vlLeftOK) {
-    return -1;
-  }
-
-  uint16_t mm = vlLeft.read();
-
-  if (vlLeft.timeoutOccurred()) {
-
-    Serial.println("[VL53 LEFT] timeout");
-
-    return -1;
-  }
-
-  return mm / 10;
+  return readVL53(vlLeft, vlLeftOK, vlLeftFailCount, "LEFT");
 }
 
 
-// =====================================================
-// VL53L1X RIGHT 거리 읽기 (cm)
-// =====================================================
-
 int readVL53Right() {
-
-  if (!vlRightOK) {
-    return -1;
-  }
-
-  uint16_t mm = vlRight.read();
-
-  if (vlRight.timeoutOccurred()) {
-
-    Serial.println("[VL53 RIGHT] timeout");
-
-    return -1;
-  }
-
-  return mm / 10;
+  return readVL53(vlRight, vlRightOK, vlRightFailCount, "RIGHT");
 }
 
 
@@ -2023,6 +2183,10 @@ void loop() {
   // =================================================
 
   readRaspberryPi();
+
+
+  // 실패한 VL53L1X는 3초마다 다시 초기화
+  maintainVL53L1X();
 
 
   // =================================================
