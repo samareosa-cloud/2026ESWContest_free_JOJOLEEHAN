@@ -173,6 +173,10 @@ const int BRAKE_OFF_TIME = 200;
 
 const int BRAKE_COUNT = 3;
 
+// 빨간불로 바뀌면 역토크를 이 횟수만큼 줘서 "멈추세요"를 몸으로 알린다.
+// (장애물 경고 3회와 구분되도록 2회)
+const int RED_BRAKE_COUNT = 2;
+
 
 // =====================================================
 // 횡단보도 모드
@@ -590,6 +594,16 @@ void obstacleWarning() {
     "*** OBSTACLE WARNING ***"
   );
 
+  reverseTorquePulses(BRAKE_COUNT);
+}
+
+
+// =====================================================
+// 역토크 count회 (장애물 경고 / 빨간불 정지 알림 공용)
+// =====================================================
+
+void reverseTorquePulses(int count) {
+
 
   // 진행 방향 반대
   digitalWrite(
@@ -605,7 +619,7 @@ void obstacleWarning() {
 
   for (
     int i = 0;
-    i < BRAKE_COUNT;
+    i < count;
     i++
   ) {
 
@@ -622,7 +636,7 @@ void obstacleWarning() {
     );
 
     Serial.println(
-      BRAKE_COUNT
+      count
     );
 
 
@@ -1260,6 +1274,9 @@ void handlePiMessage(
     message == "SIGNAL_RED"
   ) {
 
+    // 빨간불로 "바뀐" 순간에만 역토크 (같은 메시지 반복 시 다시 안 줌)
+    bool turnedRed = !trafficRed;
+
     crosswalkMode = true;
     trafficRed = true;
 
@@ -1268,6 +1285,15 @@ void handlePiMessage(
     sendBLE(
       "LIGHT:RED"
     );
+
+    // 장애물 회피 중에는 그쪽 동작을 우선
+    if (turnedRed && !obstacleTriggered) {
+
+      Serial.println("[TRAFFIC] RED -> stop warning");
+
+      reverseTorquePulses(RED_BRAKE_COUNT);
+      flushTFmini();
+    }
 
     return;
   }
