@@ -41,12 +41,22 @@ FLIP_LEFT_RIGHT = True
 # ====================================================================
 # [ESP32 전송] 메시지 이름은 docs/PROTOCOL.md 기준 (ESP32/앱과 공통)
 # ====================================================================
-# 라즈베리파이 GPIO14(TX)/GPIO15(RX) UART 포트.
-# /dev/serial0 은 Pi 4/Pi 5 모두 GPIO UART를 가리키는 링크이므로 가장 먼저 쓴다.
-# (Pi 4 기본 설정에서 /dev/ttyAMA0 은 블루투스 칩에 연결되어 있어서
-#  열기와 쓰기는 성공하지만 ESP32에는 아무것도 도착하지 않는다.)
-SERIAL_PORT_CANDIDATES = ['/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0', '/dev/ttyUSB0']
+# 라즈베리파이 GPIO14(TX)/GPIO15(RX) UART 포트. 보드에 따라 이름이 다르다.
+#  - Pi 5: GPIO14/15 = /dev/ttyAMA0 (/boot/firmware/config.txt 에 dtparam=uart0=on 필요)
+#          /dev/serial0 은 기본적으로 HDMI 사이 3핀 디버그 단자(ttyAMA10)라 쓰면 안 된다.
+#  - Pi 4: GPIO14/15 = /dev/serial0 (ttyAMA0 은 기본적으로 블루투스 칩)
+PI5_SERIAL_PORTS = ['/dev/ttyAMA0', '/dev/ttyUSB0']
+PI4_SERIAL_PORTS = ['/dev/serial0', '/dev/ttyS0', '/dev/ttyUSB0']
 SERIAL_BAUD = 115200
+
+# ====================================================================
+# [속도 튜닝] YOLO 추론 입력 크기
+# ====================================================================
+# 카메라는 640x480 그대로 두고(줄무늬 각도/신호등 색 분석은 원본 해상도 사용),
+# YOLO에 넣는 크기만 줄인다. 640 -> 416 이면 연산량이 약 42%로 줄어든다.
+# 32의 배수만 사용 (320 / 416 / 480 / 640). 640이면 기존과 동일.
+# 멀리 있는 신호등을 놓치면 480으로 올린다.
+YOLO_IMGSZ = 416
 
 # 건너는 동안 현재 보정 방향(CROSS_MOTOR:L/R/CENTER)을 이 간격(초)으로
 # 계속 다시 보낸다. ESP32는 1초 동안 소식이 없으면 스스로 멈춘다.
@@ -57,7 +67,7 @@ CROSS_RESEND_SEC = 0.3
 STATE_RESEND_SEC = 1.0
 
 # 횡단보도 박스가 화면 아래쪽에 이 프레임 수만큼 보여야 CROSSWALK:1 전송.
-# (Pi 4 추론 속도 기준 10프레임은 수 초가 걸려 "화면엔 보이는데 앱엔 안 뜸"처럼 보였다)
+# (추론 속도 기준 10프레임은 수 초가 걸려 "화면엔 보이는데 앱엔 안 뜸"처럼 보였다)
 CROSSWALK_CONFIRM_FRAMES = 5
 
 CROSSING_EVENTS = ["STRAIGHT", "LEFT_CORRECTION", "RIGHT_CORRECTION", "CROSSING_UNKNOWN"]
@@ -352,9 +362,21 @@ class EspLink:
         return messages
 
 
+def pi_model():
+    try:
+        with open('/proc/device-tree/model') as f:
+            return f.read().strip('\x00 \n')
+    except OSError:
+        return ''
+
+
 def open_esp_serial():
-    """GPIO UART 포트를 순서대로 찾아 연다. 실패하면 None."""
-    for port in SERIAL_PORT_CANDIDATES:
+    """보드에 맞는 GPIO UART 포트를 순서대로 찾아 연다. 실패하면 None."""
+    model_name = pi_model()
+    is_pi5 = 'Raspberry Pi 5' in model_name
+    ports = PI5_SERIAL_PORTS if is_pi5 else PI4_SERIAL_PORTS
+    print(f"보드: {model_name or '알 수 없음'} -> 시리얼 후보 {ports}")
+    for port in ports:
         if not os.path.exists(port):
             continue
         try:
@@ -364,8 +386,12 @@ def open_esp_serial():
             return ser
         except Exception as e:
             print(f"ESP32 시리얼 {port} 열기 실패: {e}")
-    print("ESP32 시리얼 연결 실패 (통신 없이 진행합니다). "
-          "raspi-config에서 Serial Port 활성화(enable_uart=1) 여부를 확인하세요.")
+    if is_pi5:
+        print("ESP32 시리얼 연결 실패 (통신 없이 진행합니다). "
+              "/boot/firmware/config.txt 에 dtparam=uart0=on 추가 후 재부팅하세요.")
+    else:
+        print("ESP32 시리얼 연결 실패 (통신 없이 진행합니다). "
+              "raspi-config에서 Serial Port 활성화(enable_uart=1) 여부를 확인하세요.")
     return None
 
 # ====================================================================
@@ -510,7 +536,7 @@ print("로딩 완료!")
 
 esp_serial = None
 if HAS_SERIAL:
-    # 라즈베리파이 GPIO UART(/dev/serial0)를 우선 사용. USB 연결이면 /dev/ttyUSB0.
+    # Pi 5는 /dev/ttyAMA0, Pi 4는 /dev/serial0. USB 연결이면 /dev/ttyUSB0.
     esp_serial = open_esp_serial()
 
 esp_link = EspLink(esp_serial)
@@ -532,7 +558,7 @@ else:
     exit()
 
 print("--------------------------------------------------------------------------------")
-print("통합 AI 시작 (라즈베리파이 4 + Picamera2 버전)")
+print(f"통합 AI 시작 (라즈베리파이 5 + Picamera2, YOLO 입력 {YOLO_IMGSZ})")
 print("화면 클릭 후 'q'를 누르면 종료됩니다.")
 print("--------------------------------------------------------------------------------")
 
@@ -575,7 +601,7 @@ try:
         frame_center_x = frame_w // 2
         bottom_40_percent_y = int(frame_h * 0.4)
 
-        results = model(frame, stream=False, verbose=False)
+        results = model(frame, imgsz=YOLO_IMGSZ, stream=False, verbose=False)
         boxes = results[0].boxes
 
         # ====================================================================
@@ -875,7 +901,7 @@ try:
         dot_color = (0, 255, 0) if escape_guard.armed else (0, 0, 255)
         cv2.circle(frame, (235, 89), 4, dot_color, -1)
 
-        cv2.imshow('Pi4 + Camera Mod 3 AI', frame)
+        cv2.imshow('Pi5 + Camera Mod 3 AI', frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
