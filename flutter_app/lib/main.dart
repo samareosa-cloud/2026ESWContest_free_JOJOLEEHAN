@@ -1914,6 +1914,12 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         throw Exception('이 휴대폰은 BLE를 지원하지 않습니다.');
       }
 
+      // Android 11 이하(예: 갤럭시 S6 엣지, Android 7)는 위치(GPS)가
+      // 꺼져 있으면 BLE 스캔 결과가 하나도 오지 않는다.
+      if (Platform.isAndroid && !await Geolocator.isLocationServiceEnabled()) {
+        throw const _LocationOffException();
+      }
+
       if (!kIsWeb &&
           Platform.isAndroid &&
           FlutterBluePlus.adapterStateNow != BluetoothAdapterState.on) {
@@ -2126,8 +2132,16 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
       if (!_bleProblemAnnounced) {
         _bleProblemAnnounced = true;
         _enqueueSystemSpeech(
-          '지팡이를 찾고 있습니다. 지팡이 전원을 확인해 주세요.',
+          e is _LocationOffException
+              ? '휴대폰 위치 기능을 켜 주세요. 위치가 꺼져 있으면 지팡이를 찾을 수 없습니다.'
+              : '지팡이를 찾고 있습니다. 지팡이 전원을 확인해 주세요.',
         );
+      }
+
+      if (e is _LocationOffException && mounted) {
+        setState(() {
+          _bleStatus = '위치(GPS)를 켜 주세요';
+        });
       }
 
       _scheduleBleReconnect();
@@ -3491,6 +3505,14 @@ class _RouteProjection {
   final RoutePoint nearestPoint;
   final double distanceMeters;
   final int segmentIndex;
+}
+
+// Android 11 이하에서 위치가 꺼져 BLE 스캔을 할 수 없을 때
+class _LocationOffException implements Exception {
+  const _LocationOffException();
+
+  @override
+  String toString() => '휴대폰 위치(GPS)가 꺼져 있어 BLE 스캔을 할 수 없습니다.';
 }
 
 // 현재 위치를 원점으로 하는 평면 좌표(m). x: 동쪽, y: 북쪽
