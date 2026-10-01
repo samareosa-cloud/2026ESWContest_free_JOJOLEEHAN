@@ -70,6 +70,13 @@ STATE_RESEND_SEC = 1.0
 # (추론 속도 기준 10프레임은 수 초가 걸려 "화면엔 보이는데 앱엔 안 뜸"처럼 보였다)
 CROSSWALK_CONFIRM_FRAMES = 5
 
+# True: 빨간불을 먼저 본 뒤 초록불이 켜져야 건너기 시작한다. (안전 기본값)
+#       빨간불을 못 보고 초록불부터 보면 남은 시간을 모르므로 LIGHT:GREEN_WAIT로 기다린다.
+#       시연에서는 신호등을 빨간불로 켜 둔 상태에서 시작한 뒤 초록불로 바꾼다.
+# False: 초록불만 보여도 바로 건너기 시작한다. (모형 신호등을 꺼진 상태에서 바로
+#       초록불로 켜는 시연일 때만 사용)
+REQUIRE_RED_BEFORE_GREEN = True
+
 CROSSING_EVENTS = ["STRAIGHT", "LEFT_CORRECTION", "RIGHT_CORRECTION", "CROSSING_UNKNOWN"]
 
 # ====================================================================
@@ -818,7 +825,7 @@ try:
                     green_frames += 1
                     red_frames = 0
                     if green_frames >= 10:
-                        if has_seen_red:
+                        if has_seen_red or not REQUIRE_RED_BEFORE_GREEN:
                             event = "CROSSING_START"
                             missing_cw_frames = 0
                             cw_last_seen_time = time.time()

@@ -190,7 +190,14 @@ const int RED_BRAKE_COUNT = 2;
 // =====================================================
 
 bool crosswalkMode = false;
+
+// true: 횡단 보정 모터 금지 (빨간불 / 초록불 대기 GREEN_WAIT)
 bool trafficRed = false;
+
+// 마지막으로 받은 신호가 실제 빨간불인지.
+// GREEN_WAIT도 trafficRed=true라서, 그것만 보면 GREEN_WAIT -> 빨간불로
+// 바뀔 때 빨간불 역토크가 빠진다. 역토크 판단은 이 값으로 한다.
+bool lightIsRed = false;
 
 
 // =====================================================
@@ -1301,6 +1308,7 @@ void handlePiMessage(
 
     crosswalkMode = false;
     trafficRed = false;
+    lightIsRed = false;
 
     stopCrossSteer();
 
@@ -1323,11 +1331,12 @@ void handlePiMessage(
     message == "SIGNAL_RED"
   ) {
 
-    // 빨간불로 "바뀐" 순간에만 역토크 (같은 메시지 반복 시 다시 안 줌)
-    bool turnedRed = !trafficRed;
+    // 빨간불로 "바뀐" 순간에만 역토크 (Pi가 1초마다 다시 보내도 반복 안 함)
+    bool turnedRed = !lightIsRed;
 
     crosswalkMode = true;
     trafficRed = true;
+    lightIsRed = true;
 
     stopCrossSteer();
 
@@ -1359,6 +1368,7 @@ void handlePiMessage(
 
     crosswalkMode = true;
     trafficRed = false;
+    lightIsRed = false;
 
     stopCrossSteer();
 
@@ -1380,6 +1390,7 @@ void handlePiMessage(
 
     crosswalkMode = true;
     trafficRed = true;
+    lightIsRed = false;
 
     stopCrossSteer();
 
@@ -1415,6 +1426,7 @@ void handlePiMessage(
 
     crosswalkMode = true;
     trafficRed = false;
+    lightIsRed = false;
 
     stopCrossSteer();
 
@@ -1474,6 +1486,7 @@ void handlePiMessage(
 
     crosswalkMode = false;
     trafficRed = false;
+    lightIsRed = false;
 
     stopCrossSteer();
 

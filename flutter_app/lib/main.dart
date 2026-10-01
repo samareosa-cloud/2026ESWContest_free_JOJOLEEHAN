@@ -56,6 +56,19 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
     defaultValue: '',
   );
 
+  // ===========================================================================
+  // 횡단보도 시연 모드
+  // 실행:
+  // flutter run --dart-define=CROSSWALK_DEMO=true
+  //
+  // 목적지 질문/음성 인식/TMAP 길안내를 끄고, 라즈베리파이 횡단보도·신호등
+  // 안내만 사용한다. (목적지 재질문 음성이 시연 안내를 끊지 않게 함)
+  // ===========================================================================
+  static const bool crosswalkDemoMode = bool.fromEnvironment(
+    'CROSSWALK_DEMO',
+    defaultValue: false,
+  );
+
   static const String tmapHost = 'apis.openapi.sk.com';
   static const String tmapPoiPath = '/tmap/pois';
   static const String tmapPedestrianPath = '/tmap/routes/pedestrian';
@@ -282,6 +295,14 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   Future<void> _initializeVoiceSystem() async {
     try {
       await _setupTts();
+
+      if (crosswalkDemoMode) {
+        // 음성 인식을 초기화하지 않으므로 목적지 재질문도 일어나지 않는다.
+        _setSpeechStatus('횡단보도 시연 모드');
+        await _speak('횡단보도 시연 모드입니다.');
+        return;
+      }
+
       await _setupSpeechToText();
 
       if (tmapAppKey.isEmpty) {
