@@ -2,6 +2,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Wire.h>
+#include <VL53L1X.h>
 
 
 // =====================================================
@@ -26,6 +28,34 @@
 #define TF_TX 17
 
 HardwareSerial TFSerial(2);
+
+
+// =====================================================
+// VL53L1X LEFT / RIGHT
+//
+// 두 센서는 기본 I2C 주소가 0x29로 같기 때문에
+// XSHUT으로 하나씩 켜서 주소를 바꿔 사용한다.
+//
+// LEFT  XSHUT -> GPIO23, address 0x30
+// RIGHT XSHUT -> GPIO26, address 0x31
+// SDA -> GPIO21 (공유)
+// SCL -> GPIO22 (공유)
+// =====================================================
+
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+#define VL_LEFT_XSHUT 23
+#define VL_RIGHT_XSHUT 26
+
+#define VL_LEFT_ADDR 0x30
+#define VL_RIGHT_ADDR 0x31
+
+VL53L1X vlLeft;
+VL53L1X vlRight;
+
+bool vlLeftOK = false;
+bool vlRightOK = false;
 
 
 // =====================================================
@@ -79,7 +109,54 @@ bool bleConnected = false;
 const int OBSTACLE_DISTANCE = 30;
 const int RESET_DISTANCE = 40;
 
+// 저번 장애물 회피 로직
+// TFmini 30cm 이하가 3회 연속 들어와야 실제 장애물로 판단
+const int OBSTACLE_CONFIRM_COUNT = 3;
+
+// 좌/우 VL53L1X 판단 기준
+const int SIDE_BLOCK_DISTANCE = 30;
+const int DIRECTION_MARGIN = 20;
+
+// 한쪽 센서가 고장(-1)이고 반대쪽이 막혔을 때 고장난 쪽으로 유도할지.
+// true : 시연용. 사용자가 지팡이를 잡고 걷고, 정면 TFmini가 계속 감시한다.
+// false: 고장난 쪽은 막힌 것으로 보고 멈춤(AVOID:BLOCKED).
+const bool SIDE_FAIL_AS_OPEN = true;
+
+int obstacleCount = 0;
 bool obstacleTriggered = false;
+
+
+// =====================================================
+// 장애물 회피 유도
+//
+// 역토크 후 고른 방향(좌/우)으로, 정면이 트일 때
+// (TFmini RESET_DISTANCE 이상)까지 계속 당겨 준다.
+// 예전에는 250ms 한 번만 당기고 끝나서, 정면이 여전히
+// 막혀 있어도 아무 동작을 하지 않았다.
+// =====================================================
+
+const int AVOID_PWM = 70;           // 일반 유도(55)보다 조금 강하게
+const int AVOID_PULSE_TIME = 400;   // 한 번 당기는 시간 (ms)
+const int AVOID_REPEAT_MS = 900;    // 당김 시작 간격 (ms)
+const int AVOID_MAX_PULSES = 8;     // 이만큼 당겨도 정면이 막혀 있으면 "길 막힘"
+
+enum AvoidState {
+  AVOID_NONE,
+  AVOID_LEFT,
+  AVOID_RIGHT,
+  AVOID_BLOCKED
+};
+
+AvoidState avoidState = AVOID_NONE;
+
+int avoidPulseCount = 0;
+unsigned long lastAvoidPulseAt = 0;
+unsigned long avoidPulseEndAt = 0;
+bool avoidPulseRunning = false;
+
+// loop에서 300ms마다 갱신되는 최근 좌/우 거리 (cm, 실패 시 -1)
+int lastLeftDistance = -1;
+int lastRightDistance = -1;
 
 
 // =====================================================
@@ -94,12 +171,16 @@ const int GUIDE_TIME = 250;
 // 역토크 설정
 // =====================================================
 
-const int BRAKE_PWM = 33;
+const int BRAKE_PWM = 45;
 
 const int BRAKE_ON_TIME = 300;
 const int BRAKE_OFF_TIME = 200;
 
 const int BRAKE_COUNT = 3;
+
+// 빨간불로 바뀌면 역토크를 이 횟수만큼 줘서 "멈추세요"를 몸으로 알린다.
+// (장애물 경고 3회와 구분되도록 2회)
+const int RED_BRAKE_COUNT = 2;
 
 
 // =====================================================
@@ -111,6 +192,28 @@ const int BRAKE_COUNT = 3;
 
 bool crosswalkMode = false;
 bool trafficRed = false;
+
+
+// =====================================================
+// 횡단 중 방향 보정 (Raspberry Pi CROSS_MOTOR:L/R/CENTER)
+//
+// Pi는 건너는 동안 현재 보정 방향을 0.3초마다 계속 보낸다.
+// ESP32는 받은 방향을 "상태"로 기억하고, CENTER가 오거나
+// 방향이 바뀔 때까지 CROSS_REPEAT_MS마다 계속 당긴다.
+// 안전장치: CROSS_TIMEOUT_MS 동안 Pi 소식이 없으면 스스로 멈춘다.
+// =====================================================
+
+const int CROSS_PWM = 60;
+const int CROSS_PULSE_TIME = 300;    // 한 번 당기는 시간 (ms)
+const int CROSS_REPEAT_MS = 600;     // 당김 시작 간격 (ms)
+const int CROSS_TIMEOUT_MS = 1000;   // Pi 메시지 끊김 판단 (ms)
+
+char crossSteer = 'C';               // 'L' / 'R' / 'C'
+unsigned long lastCrossMsgAt = 0;
+unsigned long lastCrossPulseAt = 0;
+unsigned long crossPulseEndAt = 0;
+bool crossPulseRunning = false;
+bool crossPulseStartNow = false;
 
 
 // =====================================================
@@ -336,81 +439,154 @@ void guideForward() {
 }
 
 // =====================================================
-// 횡단보도 LEFT 보정
-// Raspberry Pi -> CROSS_MOTOR:L
+// 횡단보도 보정 상태 변경
+// Raspberry Pi -> CROSS_MOTOR:L / R / CENTER
+//
+// 여기서는 상태만 바꾸고, 실제 당김은 updateCrosswalkSteering()이
+// loop에서 반복한다. 앱에는 방향이 바뀔 때만 알린다.
 // =====================================================
+
+void setCrossSteer(char dir) {
+
+  lastCrossMsgAt = millis();
+
+  if (dir == crossSteer) {
+    return;
+  }
+
+  crossSteer = dir;
+
+  // 당기던 중이면 끊고, 새 방향은 바로 한 번 당긴다.
+  if (crossPulseRunning && !obstacleTriggered) {
+    stopMotors();
+  }
+
+  crossPulseRunning = false;
+  crossPulseStartNow = true;
+
+  Serial.print("[CROSS MOTOR] ");
+  Serial.println(dir);
+
+  if (dir == 'L') {
+    sendBLE("CROSS_MOTOR:L");
+  }
+  else if (dir == 'R') {
+    sendBLE("CROSS_MOTOR:R");
+  }
+  else {
+    sendBLE("CROSS_MOTOR:CENTER");
+  }
+}
+
+
+// 횡단 보정 멈춤 (장애물 회피 중이면 그 모터 동작은 건드리지 않음)
+void stopCrossSteer() {
+
+  crossSteer = 'C';
+
+  if (!obstacleTriggered) {
+    stopMotors();
+  }
+
+  crossPulseRunning = false;
+}
+
+
 void crosswalkLeft() {
-
-  if (
-    !crosswalkMode ||
-    trafficRed ||
-    obstacleTriggered
-  ) {
-    stopMotors();
-    return;
-  }
-
-  Serial.println("[CROSS MOTOR] LEFT");
-
-  // M1 정지
-  ledcWrite(M1_PWM, 0);
-
-  // M2를 이용해 왼쪽 유도
-  digitalWrite(M2_DIR, LOW);
-  ledcWrite(M2_PWM, GUIDE_PWM);
-
-  delay(GUIDE_TIME);
-
-  ledcWrite(M2_PWM, 0);
-
-  sendBLE("CROSS_MOTOR:L");
+  setCrossSteer('L');
 }
 
 
-// =====================================================
-// 횡단보도 RIGHT 보정
-// Raspberry Pi -> CROSS_MOTOR:R
-// =====================================================
 void crosswalkRight() {
+  setCrossSteer('R');
+}
 
+
+void crosswalkCenter() {
+  setCrossSteer('C');
+}
+
+
+// =====================================================
+// 횡단 보정 반복 (loop에서 매번 호출)
+// =====================================================
+
+void updateCrosswalkSteering() {
+
+  unsigned long now = millis();
+
+  // 당기는 시간이 끝났으면 끄기
   if (
-    !crosswalkMode ||
-    trafficRed ||
-    obstacleTriggered
+    crossPulseRunning
+    &&
+    (long)(now - crossPulseEndAt) >= 0
   ) {
-    stopMotors();
+
+    if (!obstacleTriggered) {
+      stopMotors();
+    }
+
+    crossPulseRunning = false;
+  }
+
+  // 장애물 회피가 최우선
+  if (obstacleTriggered) {
+    crossPulseRunning = false;
     return;
   }
 
-  Serial.println("[CROSS MOTOR] RIGHT");
+  if (
+    !crosswalkMode
+    ||
+    trafficRed
+    ||
+    (crossSteer != 'L' && crossSteer != 'R')
+  ) {
+    return;
+  }
 
-  // M2 정지
-  ledcWrite(M2_PWM, 0);
+  // Pi 메시지가 끊기면 멈춤 (Pi 멈춤 / 케이블 빠짐 대비)
+  if (now - lastCrossMsgAt > (unsigned long)CROSS_TIMEOUT_MS) {
 
-  // M1을 이용해 오른쪽 유도
-  digitalWrite(M1_DIR, LOW);
-  ledcWrite(M1_PWM, GUIDE_PWM);
+    Serial.println("[CROSS MOTOR] Pi timeout -> CENTER");
 
-  delay(GUIDE_TIME);
+    stopCrossSteer();
+    sendBLE("CROSS_MOTOR:CENTER");
+    return;
+  }
 
-  ledcWrite(M1_PWM, 0);
+  if (crossPulseRunning) {
+    return;
+  }
 
-  sendBLE("CROSS_MOTOR:R");
+  if (
+    !crossPulseStartNow
+    &&
+    now - lastCrossPulseAt < (unsigned long)CROSS_REPEAT_MS
+  ) {
+    return;
+  }
+
+  crossPulseStartNow = false;
+
+  if (crossSteer == 'L') {
+    // 오른쪽 바퀴 M2로 왼쪽 유도
+    ledcWrite(M1_PWM, 0);
+    digitalWrite(M2_DIR, LOW);
+    ledcWrite(M2_PWM, CROSS_PWM);
+  }
+  else {
+    // 왼쪽 바퀴 M1로 오른쪽 유도
+    ledcWrite(M2_PWM, 0);
+    digitalWrite(M1_DIR, LOW);
+    ledcWrite(M1_PWM, CROSS_PWM);
+  }
+
+  crossPulseRunning = true;
+  lastCrossPulseAt = now;
+  crossPulseEndAt = now + CROSS_PULSE_TIME;
 }
 
-
-// =====================================================
-// 횡단보도 중앙 유지
-// Raspberry Pi -> CROSS_MOTOR:CENTER
-// =====================================================
-void crosswalkCenter() {
-
-  stopMotors();
-
-  Serial.println("[CROSS MOTOR] CENTER");
-
-  sendBLE("CROSS_MOTOR:CENTER");
-}
 
 // =====================================================
 // 장애물 역토크 3회
@@ -422,6 +598,16 @@ void obstacleWarning() {
   Serial.println(
     "*** OBSTACLE WARNING ***"
   );
+
+  reverseTorquePulses(BRAKE_COUNT);
+}
+
+
+// =====================================================
+// 역토크 count회 (장애물 경고 / 빨간불 정지 알림 공용)
+// =====================================================
+
+void reverseTorquePulses(int count) {
 
 
   // 진행 방향 반대
@@ -438,7 +624,7 @@ void obstacleWarning() {
 
   for (
     int i = 0;
-    i < BRAKE_COUNT;
+    i < count;
     i++
   ) {
 
@@ -455,7 +641,7 @@ void obstacleWarning() {
     );
 
     Serial.println(
-      BRAKE_COUNT
+      count
     );
 
 
@@ -516,13 +702,549 @@ void obstacleWarning() {
 
 
 // =====================================================
+// 장애물 회피용 당김 (non-blocking)
+//
+// 기존 guideLeft()/guideRight()는 obstacleTriggered=true일 때
+// 무시하므로 회피 전용 함수를 따로 둔다.
+// delay()로 기다리지 않고 끝나는 시각만 기록해서,
+// 당기는 동안에도 TFmini/BLE 처리가 계속 돌게 한다.
+//
+// LEFT : 오른쪽 바퀴 M2 구동
+// RIGHT: 왼쪽 바퀴 M1 구동
+// =====================================================
+
+void startAvoidPulse(AvoidState side) {
+
+  bool left = side == AVOID_LEFT;
+
+  Serial.print("[AVOID] PULL ");
+  Serial.print(left ? "LEFT" : "RIGHT");
+  Serial.print(" #");
+  Serial.println(avoidPulseCount + 1);
+
+  if (left) {
+    ledcWrite(M1_PWM, 0);
+    digitalWrite(M2_DIR, LOW);
+    ledcWrite(M2_PWM, AVOID_PWM);
+  }
+  else {
+    ledcWrite(M2_PWM, 0);
+    digitalWrite(M1_DIR, LOW);
+    ledcWrite(M1_PWM, AVOID_PWM);
+  }
+
+  avoidPulseRunning = true;
+  lastAvoidPulseAt = millis();
+  avoidPulseEndAt = lastAvoidPulseAt + AVOID_PULSE_TIME;
+  avoidPulseCount++;
+
+  sendBLE(left ? "MOTOR:L" : "MOTOR:R");
+}
+
+
+// 당기는 시간이 끝났으면 모터를 끈다. loop에서 매번 호출.
+void updateAvoidPulse() {
+
+  if (
+    avoidPulseRunning
+    &&
+    (long)(millis() - avoidPulseEndAt) >= 0
+  ) {
+
+    stopMotors();
+    avoidPulseRunning = false;
+  }
+}
+
+
+// =====================================================
+// 회피 방향 고르기
+//
+// - 30cm 미만(또는 읽기 실패)인 쪽은 막힌 것으로 본다.
+//   단, 한쪽만 고장이고 반대쪽이 막혔으면 고장난 쪽으로 (SIDE_FAIL_AS_OPEN)
+// - 반사 없음(앞이 멀리 트임)은 400cm로 읽혀 열린 쪽이다.
+// - 양쪽 다 막힘 -> BLOCKED
+// - 이미 피하던 쪽이 아직 열려 있으면 유지 (좌우 왔다갔다 방지)
+// - 한쪽만 열림 -> 그쪽
+// - 둘 다 열림 -> 20cm 넘게 더 넓은 쪽, 비슷하면 오른쪽(우측 보행)
+// =====================================================
+
+AvoidState chooseAvoidSide(int leftDistance, int rightDistance) {
+
+  bool leftFailed = leftDistance < 0;
+  bool rightFailed = rightDistance < 0;
+
+  bool leftOpen = leftDistance >= SIDE_BLOCK_DISTANCE;
+  bool rightOpen = rightDistance >= SIDE_BLOCK_DISTANCE;
+
+  // 한쪽 센서만 고장: 다른 쪽이 막혔으면 고장난 쪽으로 유도한다.
+  // (예전엔 왼쪽이 -1이면 오른쪽 장애물 때 BLOCKED로 멈춰 버림)
+  // 다른 쪽이 열려 있으면 값을 아는 쪽이 우선이다.
+  if (SIDE_FAIL_AS_OPEN && leftFailed && !rightFailed && !rightOpen) {
+    leftOpen = true;
+  }
+
+  if (SIDE_FAIL_AS_OPEN && rightFailed && !leftFailed && !leftOpen) {
+    rightOpen = true;
+  }
+
+  if (!leftOpen && !rightOpen) {
+    return AVOID_BLOCKED;
+  }
+
+  if (avoidState == AVOID_LEFT && leftOpen) {
+    return AVOID_LEFT;
+  }
+
+  if (avoidState == AVOID_RIGHT && rightOpen) {
+    return AVOID_RIGHT;
+  }
+
+  if (leftOpen && !rightOpen) {
+    return AVOID_LEFT;
+  }
+
+  if (rightOpen && !leftOpen) {
+    return AVOID_RIGHT;
+  }
+
+  if (leftDistance > rightDistance + DIRECTION_MARGIN) {
+    return AVOID_LEFT;
+  }
+
+  return AVOID_RIGHT;
+}
+
+
+// 회피 상태가 바뀔 때만 앱에 알린다. (앱이 음성으로 안내)
+void setAvoidState(AvoidState next) {
+
+  if (next == avoidState) {
+    return;
+  }
+
+  avoidState = next;
+
+  if (next == AVOID_LEFT) {
+    sendBLE("AVOID:L");
+  }
+  else if (next == AVOID_RIGHT) {
+    sendBLE("AVOID:R");
+  }
+  else if (next == AVOID_BLOCKED) {
+    stopMotors();
+    avoidPulseRunning = false;
+    sendBLE("AVOID:BLOCKED");
+  }
+}
+
+
+// =====================================================
+// VL53L1X 2개 초기화
+//
+// 예전 코드는 부팅할 때 한 번만 시도해서, 왼쪽 센서가
+// 한 번 실패하면 전원을 끌 때까지 계속 -1(읽기 실패)이었다.
+//
+// - 센서마다 최대 3번 XSHUT 껐다 켜며 다시 시도
+// - EN 버튼 리셋 때 XSHUT 선이 헐거우면 센서가 이미
+//   0x30/0x31 주소로 남아 있을 수 있어서 그 주소로도 시도
+// - 그래도 실패하면 그 센서 XSHUT을 LOW로 꺼 둔다
+//   (0x29로 남아 다른 센서와 주소가 겹치는 것 방지)
+// - 동작 중에도 실패한 센서는 3초마다 다시 살린다
+// =====================================================
+
+// 센서 앞이 멀리 트여서 반사가 없을 때 쓸 값 (cm)
+// VL53L1X는 이때 0 같은 값 + SignalFail 상태를 준다.
+// 예전 코드는 이 0을 "30cm 미만 = 막힘"으로 봤다.
+const int SIDE_OPEN_DISTANCE = 400;
+
+// 읽기 연속 실패가 이만큼 쌓이면 센서를 다시 초기화
+const int VL53_FAIL_LIMIT = 5;
+const unsigned long VL53_RETRY_MS = 3000;
+
+int vlLeftFailCount = 0;
+int vlRightFailCount = 0;
+
+
+bool i2cDevicePresent(uint8_t address) {
+
+  Wire.beginTransmission(address);
+
+  return Wire.endTransmission() == 0;
+}
+
+
+void printI2CScan() {
+
+  Serial.print("[I2C] found:");
+
+  bool any = false;
+
+  for (uint8_t address = 1; address < 127; address++) {
+
+    if (i2cDevicePresent(address)) {
+
+      Serial.print(" 0x");
+      Serial.print(address, HEX);
+
+      any = true;
+    }
+  }
+
+  if (!any) {
+    Serial.print(" (none) -> SDA/SCL/VCC/GND 배선 확인");
+  }
+
+  Serial.println();
+}
+
+
+void startVL53(VL53L1X& sensor) {
+
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(50000);
+  sensor.startContinuous(50);
+}
+
+
+bool initVL53(
+  VL53L1X& sensor,
+  int xshutPin,
+  uint8_t newAddress,
+  const char* name
+) {
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+
+    // 이 센서만 껐다 켜서 기본 주소 0x29로 되돌린다
+    digitalWrite(xshutPin, LOW);
+    delay(10);
+    digitalWrite(xshutPin, HIGH);
+    delay(20);
+
+    sensor = VL53L1X();   // 주소 정보를 0x29로 초기화
+    sensor.setTimeout(100);
+
+    if (sensor.init()) {
+
+      sensor.setAddress(newAddress);
+      startVL53(sensor);
+
+      Serial.print("[OK] VL53L1X ");
+      Serial.print(name);
+      Serial.print(" addr=0x");
+      Serial.print(newAddress, HEX);
+      Serial.print(" (try ");
+      Serial.print(attempt);
+      Serial.println(")");
+
+      return true;
+    }
+
+    // XSHUT이 안 먹어서 이미 새 주소에 남아 있는 경우
+    if (i2cDevicePresent(newAddress)) {
+
+      sensor = VL53L1X();
+      sensor.setTimeout(100);
+      sensor.setAddress(newAddress);  // 0x29엔 아무도 없으니 주소 정보만 바뀜
+
+      if (sensor.init()) {
+
+        startVL53(sensor);
+
+        Serial.print("[OK] VL53L1X ");
+        Serial.print(name);
+        Serial.println(" (이미 새 주소에 있었음 -> XSHUT 선 확인)");
+
+        return true;
+      }
+    }
+
+    Serial.print("[RETRY] VL53L1X ");
+    Serial.print(name);
+    Serial.print(" init failed, try ");
+    Serial.println(attempt);
+
+    delay(30);
+  }
+
+  // 실패한 센서는 꺼 둔다 (0x29 주소 충돌 방지)
+  digitalWrite(xshutPin, LOW);
+
+  Serial.print("[ERROR] VL53L1X ");
+  Serial.print(name);
+  Serial.println(" init failed -> 배선(VCC/GND/SDA/SCL/XSHUT) 확인");
+
+  return false;
+}
+
+
+void setupVL53L1X() {
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  pinMode(VL_LEFT_XSHUT, OUTPUT);
+  pinMode(VL_RIGHT_XSHUT, OUTPUT);
+
+  // 둘 다 끄기
+  digitalWrite(VL_LEFT_XSHUT, LOW);
+  digitalWrite(VL_RIGHT_XSHUT, LOW);
+
+  delay(20);
+
+  // 꺼 둔 상태에서 무엇이 보이는지 (보이면 XSHUT 선이 안 먹는 것)
+  printI2CScan();
+
+  // LEFT 먼저 0x30, 그다음 RIGHT 0x31
+  // (오른쪽은 꺼진 상태라 0x29 충돌 없음)
+  vlLeftOK = initVL53(vlLeft, VL_LEFT_XSHUT, VL_LEFT_ADDR, "LEFT ");
+  vlRightOK = initVL53(vlRight, VL_RIGHT_XSHUT, VL_RIGHT_ADDR, "RIGHT");
+
+  printI2CScan();
+
+  vlLeftFailCount = 0;
+  vlRightFailCount = 0;
+}
+
+
+// 동작 중 실패한 센서 다시 살리기 (loop에서 호출)
+void maintainVL53L1X() {
+
+  static unsigned long lastRetry = 0;
+
+  bool leftBad = !vlLeftOK || vlLeftFailCount >= VL53_FAIL_LIMIT;
+  bool rightBad = !vlRightOK || vlRightFailCount >= VL53_FAIL_LIMIT;
+
+  if (!leftBad && !rightBad) {
+    return;
+  }
+
+  // 회피 중에는 초기화(수백 ms)로 루프를 막지 않는다
+  if (obstacleTriggered) {
+    return;
+  }
+
+  if (millis() - lastRetry < VL53_RETRY_MS) {
+    return;
+  }
+
+  lastRetry = millis();
+
+  // 한 번에 한 센서만. 다른 센서는 0x30/0x31에 있으니 0x29 충돌 없음
+  if (leftBad) {
+
+    vlLeftOK = initVL53(vlLeft, VL_LEFT_XSHUT, VL_LEFT_ADDR, "LEFT ");
+    vlLeftFailCount = 0;
+  }
+  else {
+
+    vlRightOK = initVL53(vlRight, VL_RIGHT_XSHUT, VL_RIGHT_ADDR, "RIGHT");
+    vlRightFailCount = 0;
+  }
+}
+
+
+// =====================================================
+// VL53L1X 거리 읽기 (cm)
+//
+// -1  : 센서 고장/응답 없음
+// 400 : 반사 없음 (앞이 멀리 트임) -> 열린 쪽으로 본다
+// =====================================================
+
+int readVL53(VL53L1X& sensor, bool ok, int& failCount, const char* name) {
+
+  if (!ok) {
+    return -1;
+  }
+
+  uint16_t mm = sensor.read();
+
+  if (sensor.timeoutOccurred()) {
+
+    failCount++;
+
+    Serial.print("[VL53 ");
+    Serial.print(name);
+    Serial.println("] timeout");
+
+    return -1;
+  }
+
+  failCount = 0;
+
+  VL53L1X::RangeStatus status = sensor.ranging_data.range_status;
+
+  if (
+    status == VL53L1X::SignalFail
+    ||
+    status == VL53L1X::OutOfBoundsFail
+  ) {
+    return SIDE_OPEN_DISTANCE;
+  }
+
+  return mm / 10;
+}
+
+
+int readVL53Left() {
+  return readVL53(vlLeft, vlLeftOK, vlLeftFailCount, "LEFT");
+}
+
+
+int readVL53Right() {
+  return readVL53(vlRight, vlRightOK, vlRightFailCount, "RIGHT");
+}
+
+
+// =====================================================
+// 장애물 확정 시 1회 실행
+//
+// 1) 역토크 3회로 멈춤 알림
+// 2) 좌/우 VL53L1X로 회피 방향 결정 (chooseAvoidSide)
+// 3) 그 방향으로 첫 당김 시작
+//    -> 이후 updateObstacleAvoidance()가 정면이 트일 때까지 반복
+// =====================================================
+
+void handleObstacleAvoidance(int frontDistance) {
+
+  // ===================================================
+  // 1. 정면 장애물 확정 후 역토크 3회 먼저 실행
+  // ===================================================
+  stopMotors();
+
+  Serial.println();
+  Serial.println("[AVOID] FRONT OBSTACLE CONFIRMED -> BRAKE FIRST");
+
+  // Flutter 앱에 장애물 음성 안내 요청.
+  // 장애물 1건당 역토크 시작 직전에 딱 한 번만 전송한다.
+  sendBLE("OBSTACLE_BRAKE");
+
+  // BLE Notify가 앱으로 전달될 시간을 아주 짧게 확보.
+  delay(50);
+
+  // 역토크 3회
+  obstacleWarning();
+
+  // 역토크 직후 잠깐 안정화
+  delay(100);
+
+  // 역토크 동안 쌓인 옛날 거리 데이터 버리기
+  flushTFmini();
+
+
+  // ===================================================
+  // 2. 좌우 VL53L1X 거리 측정
+  // ===================================================
+  int leftDistance = readVL53Left();
+  int rightDistance = readVL53Right();
+
+
+  Serial.println();
+  Serial.println("========== OBSTACLE AVOID ==========");
+
+  Serial.print("FRONT = ");
+  Serial.print(frontDistance);
+  Serial.println(" cm");
+
+  Serial.print("LEFT  = ");
+  Serial.print(leftDistance);
+  Serial.println(" cm");
+
+  Serial.print("RIGHT = ");
+  Serial.print(rightDistance);
+  Serial.println(" cm");
+
+
+  lastLeftDistance = leftDistance;
+  lastRightDistance = rightDistance;
+
+  avoidPulseCount = 0;
+  avoidPulseRunning = false;
+  avoidState = AVOID_NONE;
+
+  AvoidState side = chooseAvoidSide(leftDistance, rightDistance);
+
+  setAvoidState(side);
+
+  if (side == AVOID_BLOCKED) {
+    // 양쪽 다 막힘 (또는 센서 읽기 실패). 역토크는 이미 실행됨.
+    Serial.println("[AVOID] BOTH SIDES BLOCKED -> STOP");
+    return;
+  }
+
+  startAvoidPulse(side);
+}
+
+
+// =====================================================
+// 장애물 회피 중 반복 (loop에서 obstacleTriggered일 때 매번 호출)
+//
+// 정면이 아직 막혀 있으면 AVOID_REPEAT_MS마다 다시 당긴다.
+// 당길 때마다 좌/우를 다시 확인해서, 피하던 쪽이 막히면
+// 반대쪽으로 바꾸고 둘 다 막히면 멈춘다.
+// AVOID_MAX_PULSES번 당겨도 정면이 안 트이면 "길 막힘"으로
+// 역토크를 한 번 더 주고 멈춘다.
+// =====================================================
+
+void updateObstacleAvoidance() {
+
+  updateAvoidPulse();
+
+  if (
+    avoidState != AVOID_LEFT
+    &&
+    avoidState != AVOID_RIGHT
+  ) {
+    return;
+  }
+
+  if (avoidPulseRunning) {
+    return;
+  }
+
+  if (millis() - lastAvoidPulseAt < (unsigned long)AVOID_REPEAT_MS) {
+    return;
+  }
+
+  if (avoidPulseCount >= AVOID_MAX_PULSES) {
+
+    Serial.println("[AVOID] front still blocked -> BLOCKED");
+
+    setAvoidState(AVOID_BLOCKED);
+
+    obstacleWarning();
+    flushTFmini();
+
+    return;
+  }
+
+  AvoidState side =
+      chooseAvoidSide(lastLeftDistance, lastRightDistance);
+
+  setAvoidState(side);
+
+  if (
+    side == AVOID_LEFT
+    ||
+    side == AVOID_RIGHT
+  ) {
+
+    startAvoidPulse(side);
+  }
+}
+
+
+// =====================================================
 // TFmini 읽기
+//
+// 버퍼에 쌓인 프레임을 모두 읽고 "가장 최근" 거리를 돌려준다.
+// 역토크처럼 delay()가 긴 동작 뒤에는 옛날 프레임이 쌓여 있어서,
+// 첫 프레임만 읽으면 이미 지난 거리로 판단하게 된다.
 // =====================================================
 
 int readTFmini() {
 
-  static uint8_t buf[9];
-
+  int latest = -1;
 
   while (
     TFSerial.available() >= 9
@@ -536,40 +1258,27 @@ int readTFmini() {
     }
 
 
-    // 두 번째 헤더
+    // 두 번째 헤더 (아니면 버리지 않고 다음 바이트부터 다시 찾음)
     if (
-      TFSerial.read() != 0x59
+      TFSerial.peek() != 0x59
     ) {
       continue;
     }
 
+    TFSerial.read();
+
+
+    uint8_t buf[9];
 
     buf[0] = 0x59;
     buf[1] = 0x59;
 
-
+    // available() >= 9 였으므로 나머지 7바이트는 이미 들어와 있음
     for (
       int i = 2;
       i < 9;
       i++
     ) {
-
-      unsigned long start =
-          millis();
-
-
-      while (
-        !TFSerial.available()
-      ) {
-
-        if (
-          millis() - start > 10
-        ) {
-
-          return -1;
-        }
-      }
-
 
       buf[i] =
           TFSerial.read();
@@ -578,7 +1287,6 @@ int readTFmini() {
 
     // checksum
     uint16_t checksum = 0;
-
 
     for (
       int i = 0;
@@ -589,7 +1297,6 @@ int readTFmini() {
       checksum +=
           buf[i];
     }
-
 
     checksum &=
         0xFF;
@@ -603,35 +1310,48 @@ int readTFmini() {
         "[TFmini] checksum error"
       );
 
-      return -1;
+      continue;
     }
 
 
     // 거리 cm
-    uint16_t distance =
+    latest =
         buf[2] |
         (buf[3] << 8);
-
-
-    return distance;
   }
 
 
-  return -1;
+  return latest;
+}
+
+
+// 긴 동작(역토크 등) 뒤에 쌓인 옛날 TFmini 데이터를 버린다.
+void flushTFmini() {
+
+  while (
+    TFSerial.available()
+  ) {
+
+    TFSerial.read();
+  }
 }
 
 
 // =====================================================
 // Raspberry Pi 메시지 처리
 //
-// Raspberry Pi에서 아래처럼 보내면 됨.
+// Raspberry Pi에서 아래처럼 보내면 됨. (docs/PROTOCOL.md)
 //
 // CROSSWALK:1
 // CROSSWALK:0
 //
 // LIGHT:RED
 // LIGHT:GREEN
+// LIGHT:GREEN_WAIT
 // LIGHT:NONE
+//
+// CROSSING_START / CROSSING_END
+// CROSS_MOTOR:L / CROSS_MOTOR:R / CROSS_MOTOR:CENTER  (0.3초마다 반복)
 //
 // 각 메시지 뒤에는 반드시 \n
 // =====================================================
@@ -670,7 +1390,7 @@ void handlePiMessage(
 
     crosswalkMode = true;
 
-    stopMotors();
+    stopCrossSteer();
 
 
     sendBLE(
@@ -693,7 +1413,7 @@ void handlePiMessage(
     crosswalkMode = false;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
 
     sendBLE(
@@ -714,14 +1434,26 @@ void handlePiMessage(
     message == "SIGNAL_RED"
   ) {
 
+    // 빨간불로 "바뀐" 순간에만 역토크 (같은 메시지 반복 시 다시 안 줌)
+    bool turnedRed = !trafficRed;
+
     crosswalkMode = true;
     trafficRed = true;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "LIGHT:RED"
     );
+
+    // 장애물 회피 중에는 그쪽 동작을 우선
+    if (turnedRed && !obstacleTriggered) {
+
+      Serial.println("[TRAFFIC] RED -> stop warning");
+
+      reverseTorquePulses(RED_BRAKE_COUNT);
+      flushTFmini();
+    }
 
     return;
   }
@@ -739,10 +1471,31 @@ void handlePiMessage(
     crosswalkMode = true;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "LIGHT:GREEN"
+    );
+
+    return;
+  }
+
+
+  // -------------------------------------------------
+  // 초록불이 이미 켜져 있음 (빨간불을 못 봄)
+  // 남은 시간을 모르므로 건너지 않고 다음 신호를 기다린다.
+  // -------------------------------------------------
+  if (
+    message == "LIGHT:GREEN_WAIT"
+  ) {
+
+    crosswalkMode = true;
+    trafficRed = true;
+
+    stopCrossSteer();
+
+    sendBLE(
+      "LIGHT:GREEN_WAIT"
     );
 
     return;
@@ -774,7 +1527,7 @@ void handlePiMessage(
     crosswalkMode = true;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "CROSSING_START"
@@ -833,7 +1586,7 @@ void handlePiMessage(
     crosswalkMode = false;
     trafficRed = false;
 
-    stopMotors();
+    stopCrossSteer();
 
     sendBLE(
       "CROSSING_END"
@@ -1280,6 +2033,13 @@ void setup() {
 
 
   // =================================================
+  // VL53L1X LEFT / RIGHT
+  // =================================================
+
+  setupVL53L1X();
+
+
+  // =================================================
   // Raspberry Pi UART
   // =================================================
 
@@ -1397,7 +2157,15 @@ void setup() {
   );
 
   Serial.println(
-    " <= 30 cm  : reverse torque x3"
+    " <= 30 cm x3 : voice alert + reverse torque x3 + compare LEFT/RIGHT"
+  );
+
+  Serial.println(
+    " then pull toward open side until front >= 40 cm"
+  );
+
+  Serial.println(
+    " both side < 30 cm or still blocked : stop"
   );
 
   Serial.println();
@@ -1415,6 +2183,62 @@ void loop() {
   // =================================================
 
   readRaspberryPi();
+
+
+  // 실패한 VL53L1X는 3초마다 다시 초기화
+  maintainVL53L1X();
+
+
+  // =================================================
+  // LEFT / RIGHT VL53L1X 거리 -> Flutter
+  // 300 ms마다 SIDE:왼쪽cm,오른쪽cm 전송
+  // 예: SIDE:82,135
+  // =================================================
+
+  static unsigned long lastSideDistanceSend = 0;
+
+  if (
+    millis() - lastSideDistanceSend >= 300
+  ) {
+
+    int leftDistance = readVL53Left();
+    int rightDistance = readVL53Right();
+
+    lastLeftDistance = leftDistance;
+    lastRightDistance = rightDistance;
+
+    Serial.print("[VL53] LEFT=");
+    Serial.print(leftDistance);
+    Serial.print(" cm | RIGHT=");
+    Serial.print(rightDistance);
+    Serial.println(" cm");
+
+    // 읽기 실패 시 -1이 전송되고, Flutter에서는 -- cm로 표시
+    sendBLE(
+      "SIDE:"
+      + String(leftDistance)
+      + ","
+      + String(rightDistance)
+    );
+
+    lastSideDistanceSend = millis();
+  }
+
+
+  // =================================================
+  // 장애물 회피 중이면 정면이 트일 때까지 계속 유도
+  // =================================================
+
+  if (obstacleTriggered) {
+    updateObstacleAvoidance();
+  }
+
+
+  // =================================================
+  // 횡단 중이면 Pi 보정 방향으로 계속 유도
+  // =================================================
+
+  updateCrosswalkSteering();
 
 
   // =================================================
@@ -1485,14 +2309,48 @@ void loop() {
 
 
     // -------------------------------------------------
-    // 30cm 이하
-    //
-    // 역토크는 한 장애물당 한 번만
+    // TFmini 30cm 이하가 3회 연속 들어오면
+    // LEFT / RIGHT VL53L1X를 비교해서 회피 방향 결정
     // -------------------------------------------------
 
     if (
       distance <=
           OBSTACLE_DISTANCE
+    ) {
+
+      if (
+        obstacleCount <
+            OBSTACLE_CONFIRM_COUNT
+      ) {
+
+        obstacleCount++;
+
+        Serial.print(
+          "[OBSTACLE COUNT] "
+        );
+
+        Serial.print(
+          obstacleCount
+        );
+
+        Serial.print(
+          "/"
+        );
+
+        Serial.println(
+          OBSTACLE_CONFIRM_COUNT
+        );
+      }
+    }
+    else {
+
+      obstacleCount = 0;
+    }
+
+
+    if (
+      obstacleCount >=
+          OBSTACLE_CONFIRM_COUNT
       &&
       !obstacleTriggered
     ) {
@@ -1508,15 +2366,14 @@ void loop() {
       );
 
 
-      stopMotors();
-
-
-      obstacleWarning();
+      handleObstacleAvoidance(
+        distance
+      );
     }
 
 
     // -------------------------------------------------
-    // 40cm 이상으로 다시 멀어지면 reset
+    // 정면이 40cm 이상으로 다시 멀어지면 reset
     // -------------------------------------------------
 
     if (
@@ -1528,6 +2385,15 @@ void loop() {
 
       obstacleTriggered =
           false;
+
+      obstacleCount =
+          0;
+
+      // 회피 유도 종료
+      stopMotors();
+      avoidPulseRunning = false;
+      avoidPulseCount = 0;
+      avoidState = AVOID_NONE;
 
 
       sendBLE(
