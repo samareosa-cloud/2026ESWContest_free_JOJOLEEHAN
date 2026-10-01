@@ -94,7 +94,11 @@ LOSS_TREND_JITTER = 0.03       # 추세 중 최대 3%p의 작은 흔들림 허�
 LOSS_CONFIRM_FRAMES = 3       # 연속 3프레임 미검출
 LOSS_RECOVERY_SEC = 0.6        # 새 영상 근거 없는 복귀는 짧게 제한
 LOSS_RECOVERY_MAX_FRAMES = 3   # 시간 또는 프레임 제한 중 먼저 도달하면 중립
-POSITION_UNKNOWN_FRAMES = 20  # 종료 대신 위치 판단 불가 + 중립 처리
+POSITION_UNKNOWN_FRAMES = 20  # 위치 판단 불가 + 중립 처리 (종료 전 단계)
+# 건너는 중 횡단보도가 이 시간(초) 동안 한 번도 안 보이면 다 건넌 것으로 보고 종료.
+# 프레임 수가 아니라 시간 기준이라 FPS가 바뀌어도 같은 시간 뒤에 종료된다.
+# 짧게 하면 잠깐 놓쳤을 때 중간에 끝나고, 길게 하면 건넌 뒤 일반 안내 복귀가 늦어진다.
+CROSSING_END_MISSING_SEC = 3.0
 
 
 def new_crosswalk_state():
@@ -577,6 +581,7 @@ cw_close_frames = 0
 red_frames = 0
 green_frames = 0
 missing_cw_frames = 0
+cw_last_seen_time = 0.0
 has_seen_red = False
 state_crosswalk = new_crosswalk_state()
 escape_guard = CrossingEscapeGuard()
@@ -816,6 +821,7 @@ try:
                         if has_seen_red:
                             event = "CROSSING_START"
                             missing_cw_frames = 0
+                            cw_last_seen_time = time.time()
                             state_crosswalk = new_crosswalk_state()
                             escape_guard.reset()
                         else:
@@ -831,12 +837,17 @@ try:
                     event = 'RIGHT_CORRECTION'
                 elif missing_cw_frames >= NO_LINES_STRAIGHT_FRAMES or cw_direction == 'Straight':
                     event = 'STRAIGHT'
-                # 횡단보도 이탈로도 검출이 사라지므로 미검출만으로 횡단 종료를 확정하지 않습니다.
+                # 짧은 미검출은 이탈일 수 있으므로 바로 끝내지 않고 복귀/중립 안내를 먼저 합니다.
                 if missing_cw_frames >= POSITION_UNKNOWN_FRAMES:
                     event = 'CROSSING_UNKNOWN'
-                # 별도 종료 판별을 추가하기 전에는 재검출로 안내 재개 또는 q로 수동 종료합니다.
+                # 일정 시간 동안 횡단보도가 전혀 안 보이면 횡단 종료 -> 일반 길안내 복귀.
+                # 그 전에 다시 보이면 missing이 초기화되어 안내를 계속한다.
+                if time.time() - cw_last_seen_time >= CROSSING_END_MISSING_SEC:
+                    event = 'CROSSING_END'
+                    print(f"[횡단 종료] 횡단보도 {CROSSING_END_MISSING_SEC:.0f}초 미검출")
             else:
                 missing_cw_frames = 0
+                cw_last_seen_time = time.time()
                 if cw_direction == "Turn Left": event = "LEFT_CORRECTION"
                 elif cw_direction == "Turn Right": event = "RIGHT_CORRECTION"
                 else: event = "STRAIGHT"
@@ -856,6 +867,9 @@ try:
         if event == "CROSSING_START": event = "STRAIGHT"
         elif event == "CROSSING_END":
             event = "NORMAL"
+            cw_close_frames = 0
+            missing_cw_frames = 0
+            has_seen_red = False
             state_crosswalk = new_crosswalk_state()
             escape_guard.reset()
 
