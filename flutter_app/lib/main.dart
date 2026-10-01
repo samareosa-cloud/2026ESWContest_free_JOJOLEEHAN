@@ -76,6 +76,10 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   static const String txUuid =
       '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
+  // 연결이 안 되거나 끊기면 이 간격으로 계속 다시 시도한다.
+  // (ESP32 전원을 나중에 켜도 앱이 알아서 붙도록)
+  static const Duration bleRetryInterval = Duration(seconds: 3);
+
   // TFmini: 30cm 이내일 때 "장애물 감지"를 화면에 표시.
   // 음성은 ESP32가 OBSTACLE_BRAKE를 보낸 실제 역토크 시작 시점에만 출력.
   static const double obstacleWarningCm = 30.0;
@@ -195,6 +199,10 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
   bool _isBleConnected = false;
   bool _isConnecting = false;
+  Timer? _bleRetryTimer;
+
+  // 실패/끊김 음성은 한 번만 (재시도할 때마다 반복하지 않음)
+  bool _bleProblemAnnounced = false;
   bool _writeWithoutResponse = false;
   String _bleStatus = '연결 대기';
 
@@ -267,6 +275,7 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
 
     _guidanceTimer?.cancel();
     _listenRetryTimer?.cancel();
+    _bleRetryTimer?.cancel();
 
     _speech.cancel();
     _tts.stop();
@@ -1885,6 +1894,8 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
   }) async {
     if (_isConnecting || _isBleConnected) return;
 
+    _bleRetryTimer?.cancel();
+
     if (mounted) {
       setState(() {
         _isConnecting = true;
@@ -1943,8 +1954,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
             final String platformName =
                 result.device.platformName.trim();
 
+            final bool hasCaneService = result
+                .advertisementData.serviceUuids
+                .contains(Guid(serviceUuid));
+
             if (advName == targetDeviceName ||
-                platformName == targetDeviceName) {
+                platformName == targetDeviceName ||
+                hasCaneService) {
               if (!completer.isCompleted) {
                 completer.complete(result.device);
               }
@@ -1959,8 +1975,11 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         },
       );
 
+      // 이름은 광고 패킷이 아니라 스캔 응답에 실릴 수 있어서
+      // 서비스 UUID로도 함께 찾는다. (둘 중 하나만 맞아도 됨)
       await FlutterBluePlus.startScan(
         withNames: const [targetDeviceName],
+        withServices: [Guid(serviceUuid)],
         timeout: const Duration(seconds: 10),
       );
 
@@ -2055,6 +2074,13 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
             });
 
             _resetMotorCommandCache();
+
+            if (!_bleProblemAnnounced) {
+              _bleProblemAnnounced = true;
+              _enqueueSystemSpeech('지팡이 연결이 끊겼습니다. 다시 연결합니다.');
+            }
+
+            _scheduleBleReconnect();
           }
         },
       );
@@ -2080,20 +2106,31 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         _isBleConnected = true;
         _bleStatus = '연결됨';
       });
+
+      if (_bleProblemAnnounced) {
+        _enqueueSystemSpeech('지팡이와 다시 연결되었습니다.');
+      }
+
+      _bleProblemAnnounced = false;
     } catch (e) {
       if (mounted) {
         setState(() {
           _isBleConnected = false;
-          _bleStatus = '연결 실패';
+          _bleStatus = '연결 실패 · 다시 시도 중';
         });
       }
 
       debugPrint('[BLE ERROR] $e');
 
-      // 자동 연결/수동 연결 구분 없이 BLE 연결 실패 시 음성 안내
-      _enqueueSystemSpeech(
-        '블루투스 연결에 실패했습니다.',
-      );
+      // 실패 음성은 처음 한 번만. 이후에는 조용히 계속 다시 시도한다.
+      if (!_bleProblemAnnounced) {
+        _bleProblemAnnounced = true;
+        _enqueueSystemSpeech(
+          '지팡이를 찾고 있습니다. 지팡이 전원을 확인해 주세요.',
+        );
+      }
+
+      _scheduleBleReconnect();
 
       if (!silent) {
         ScaffoldMessenger.of(context)
@@ -2111,6 +2148,17 @@ class _SmartCaneHomePageState extends State<SmartCaneHomePage> {
         });
       }
     }
+  }
+
+  // 연결될 때까지 bleRetryInterval마다 조용히 다시 연결한다.
+  void _scheduleBleReconnect() {
+    if (!mounted || _isBleConnected) return;
+
+    _bleRetryTimer?.cancel();
+    _bleRetryTimer = Timer(bleRetryInterval, () {
+      if (!mounted || _isBleConnected || _isConnecting) return;
+      unawaited(_connectSmartCane(silent: true));
+    });
   }
 
   Future<void> _sendBleLine(String message) async {
