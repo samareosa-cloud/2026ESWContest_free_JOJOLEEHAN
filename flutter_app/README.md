@@ -1,4 +1,4 @@
-# Smart Cane — Flutter App
+# Flutter App
 
 스마트 지팡이의 **보행 경로 안내, 음성 목적지 입력, ESP32 BLE 통신 및 센서 상태 표시**를 담당하는 Flutter 앱입니다.
 
