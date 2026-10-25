@@ -1,710 +1,338 @@
-# Navis
+<div align="center">
+
+# 🦯 NAVIS
 
 ### AI 기반 시각장애인 반자율 보행 보조 시스템
 
-> **"길을 알려주는 것을 넘어, 안전한 방향으로 직접 유도하다."**
+**“길을 알려주는 것을 넘어, 안전한 방향으로 직접 유도하다.”**
 
-Navis는 카메라와 센서를 이용하여 보행 환경을 인식하고, 목적지 방향과 주변 상황을 종합적으로 판단하여 **모터의 조향 토크를 통해 사용자의 이동 방향을 직접 유도하는 반자율 보행 보조 시스템**입니다.
+**AI Vision · Pedestrian Navigation · Sensor Fusion · Motor Steering**
 
-특히 횡단보도에서는 횡단보도와 신호등을 인식하고, 횡단 중에도 사용자가 횡단보도를 벗어나지 않도록 지속적으로 좌·우 방향을 보정합니다.
+<img src="./docs/hardware.png" width="760" alt="NAVIS 하드웨어 구성 및 시제품" />
 
----
+[![Flutter](https://img.shields.io/badge/Flutter-02569B?logo=flutter&logoColor=white)](./flutter_app/)
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-C51A4A?logo=raspberrypi&logoColor=white)](./raspberry_pi/)
+[![ESP32](https://img.shields.io/badge/ESP32-E7352C?logo=espressif&logoColor=white)](./esp32/)
+![YOLO](https://img.shields.io/badge/YOLO-Object%20Detection-111F68)
+![OpenCV](https://img.shields.io/badge/OpenCV-5C3EE8?logo=opencv&logoColor=white)
 
-## 🚀 Intro
+**[🎬 시연 영상 보기](https://youtu.be/FR7wWThx7Qo)** · **[📱 Flutter](./flutter_app/)** · **[🍓 Raspberry Pi](./raspberry_pi/)** · **[⚙️ ESP32](./esp32/)**
 
-기존의 시각장애인용 보행 보조기기는 장애물이나 주변 환경을 감지한 뒤 **음성 또는 진동을 통해 사용자에게 정보를 전달하는 방식**이 주를 이룹니다.
-
-Navis는 여기에서 한 단계 더 나아가,
-
-**주변 환경 인식 → 상황 판단 → 이동 방향 결정 → 모터 조향**
-
-과정을 하나의 시스템으로 통합하였습니다.
-
-사용자가 장치를 직접 앞으로 이동시키며, 좌·우 모터는 장치를 지속적으로 주행시키는 용도가 아니라 **사용자가 이동해야 할 방향을 직관적으로 느낄 수 있도록 조향 토크를 제공하는 역할**을 수행합니다.
+</div>
 
 ---
 
-## 💡 Inspiration
+## ✨ NAVIS 한눈에 보기
 
-시각장애인의 보행에서는 단순히 장애물을 발견하는 것뿐만 아니라 **어느 방향으로 이동해야 하는지 판단하는 과정**이 중요합니다.
+> **사용자가 전진하고, NAVIS가 방향을 유도합니다.** 카메라·거리 센서·보행자 내비게이션 정보를 종합하여 좌·우 모터의 **조향 토크**로 방향을 전달하는 반자율 보행 보조 프로토타입입니다.
 
-특히 횡단보도에서는 다음과 같은 어려움이 발생할 수 있습니다.
+| 🧭 일반 보행 | 🚦 횡단보도 | 🛡️ 장애물 대응 |
+|:---:|:---:|:---:|
+| **TMAP + GPS + Compass** | **YOLO + HSV + 영상 기하 분석** | **TFmini + 모터 피드백** |
+| 목적지 경로와 방향 오차를 계산해 조향 | 신호 판단부터 횡단 중 중앙 정렬·이탈 복귀까지 | 전방 장애물 감지 시 역토크로 경고 |
 
-- 횡단보도의 정확한 위치 파악
-- 횡단보도 진입 방향 판단
-- 보행 신호 확인
-- 횡단 중 직선 방향 유지
-- 횡단보도 영역 이탈 방지
-- 갑작스러운 전방 장애물 대응
+### 핵심 차별점
 
-기존 보행 보조기기가 주변 상황을 사용자에게 알려주는 데 집중했다면, 사용자는 전달받은 정보를 다시 해석하고 직접 이동 방향을 결정해야 합니다.
-
-이에 Navis는 **AI Vision, Navigation, Distance Sensor, Motor Steering Guidance**를 결합하여 주변 환경을 인식하는 것에서 그치지 않고 실제 보행 방향까지 보조하는 시스템을 구현하였습니다.
-
-특히 본 프로젝트는 횡단보도를 단순히 객체로 인식하는 것에 그치지 않고,
-
-**횡단보도 인식 → 신호 판단 → 횡단 시작 → 횡단 중 방향 분석 → 좌·우 보정 → 횡단 종료**
-
-까지 하나의 연속적인 보행 과정으로 구현하는 것을 핵심 목표로 합니다.
+- **알림에서 조향으로:** 음성·진동 안내에 그치지 않고 **모터 조향 토크**로 방향을 전달
+- **횡단 중 연속 보정:** 횡단보도 **중앙 위치 + 줄무늬 각도**를 분석해 좌·우 조향
+- **이탈·소실 대응:** 횡단보도 검출 폭과 위치 변화로 이탈을 판단하고, 검출이 끊기면 **짧고 제한적인 복귀** 수행
+- **국내 보행 환경 고려:** 일반 신호등뿐 아니라 **바닥 신호등**을 인식 대상으로 포함
+- **제어 우선순위:** 장애물 안전 제어를 일반 길안내보다 우선 처리
 
 ---
 
-## 🛠 Hardware
+## 🧩 System Architecture
 
-<p align="center">
-  <img src="./docs/hardware.png" width="700">
-</p>
+아래 구조도는 **장치별 역할과 실제 통신 연결**을 나타냅니다.
 
-## 📝 Overview
+```mermaid
+flowchart LR
+    subgraph PHONE["📱 Flutter App"]
+        direction TB
+        P1["TMAP 보행자 경로"]
+        P2["GPS · Compass"]
+        P3["음성 입력 · TTS"]
+        P4["방향 명령 · 상태 UI"]
+        P1 --> P4
+        P2 --> P4
+        P3 --> P4
+    end
 
-Navis는 크게 **Flutter App, Raspberry Pi, ESP32**의 세 가지 소프트웨어 시스템으로 구성됩니다.
+    subgraph VISION["🍓 Raspberry Pi 4"]
+        direction TB
+        CAM["Camera Module"]
+        YOLO["YOLO · NCNN"]
+        CV["HSV 신호 판별<br/>횡단보도 중앙·각도·이탈 분석"]
+        CAM --> YOLO --> CV
+    end
 
-### 📱 Flutter App
+    subgraph CONTROL["⚙️ ESP32 · 중앙 제어"]
+        direction TB
+        BLE["BLE 명령·상태 통신"]
+        UART["UART 횡단 명령 수신"]
+        SENSOR["전방·측면 거리 센싱"]
+        LOGIC["안전 우선순위 · 상태 제어"]
+        MOTOR["PWM · DIR 조향 출력"]
+        BLE --> LOGIC
+        UART --> LOGIC
+        SENSOR --> LOGIC
+        LOGIC --> MOTOR
+    end
 
-사용자의 현재 위치와 목적지를 기반으로 일반 보행 경로를 안내합니다.
+    subgraph DISTANCE["📡 Distance Sensors"]
+        direction TB
+        TF["TFmini · 전방"]
+        VL["VL53L1X × 2 · 좌우"]
+    end
 
-- TMAP 기반 목적지 검색
-- 보행자 경로 생성
-- GPS 기반 현재 위치 확인
-- 스마트폰 Compass 기반 현재 진행 방향 측정
-- 목표 방위각 계산
-- 음성 목적지 입력
-- TTS 음성 안내
-- ESP32와 BLE 통신
-- 장애물 / 횡단보도 / 신호등 상태 표시
+    subgraph ACTUATOR["🛞 Motor Drive"]
+        direction TB
+        DRIVER["MDD10A"]
+        WHEELS["좌·우 DC Motor"]
+        DRIVER --> WHEELS
+    end
 
-### 🍓 Raspberry Pi
+    P4 <-->|"BLE"| BLE
+    CV -->|"UART · 115200 bps"| UART
+    TF -->|"UART · 115200 bps"| SENSOR
+    VL -->|"I2C"| SENSOR
+    MOTOR -->|"PWM / DIR"| DRIVER
 
-카메라 영상을 이용하여 주변 보행 환경을 실시간으로 분석합니다.
+    classDef app fill:#E8F2FF,stroke:#377BD1,color:#142D50,stroke-width:2px;
+    classDef vision fill:#FFF0F0,stroke:#C65365,color:#53222B,stroke-width:2px;
+    classDef ctrl fill:#E8F8F0,stroke:#21845B,color:#143D2B,stroke-width:2px;
+    classDef sensor fill:#FFF5DC,stroke:#C58B23,color:#573D10,stroke-width:2px;
+    classDef motor fill:#F0EBFF,stroke:#7862BE,color:#34265C,stroke-width:2px;
+    class P1,P2,P3,P4 app;
+    class CAM,YOLO,CV vision;
+    class BLE,UART,SENSOR,LOGIC,MOTOR ctrl;
+    class TF,VL sensor;
+    class DRIVER,WHEELS motor;
+```
 
-- YOLO 기반 객체 인식
-- 횡단보도 인식
-- 신호등 인식
-- 점자블록 및 계단 등 보행환경 객체 인식
-- 횡단보도 방향 분석
-- 횡단 중 좌·우 보정 방향 결정
-- ESP32와 UART 통신
-
-### ⚙️ ESP32
-
-각 시스템의 정보를 실제 모터 동작으로 변환하는 중앙 제어기 역할을 수행합니다.
-
-- Flutter App과 BLE 통신
-- Raspberry Pi와 UART 통신
-- TFmini 거리 센서 처리
-- MDD10A 모터 드라이버 제어
-- 일반 길안내 조향
-- 횡단보도 조향
-- 장애물 감지 및 역토크 경고
-- 시스템 제어 우선순위 관리
+| 구성 요소 | 핵심 역할 | 연결 |
+|---|---|---|
+| **Flutter App** | 목적지 검색, 경로 안내, 방위각 계산, 음성·상태 UI | ESP32 ↔ **BLE** |
+| **Raspberry Pi 4** | YOLO 객체 인식, 신호등 색상 판별, 횡단 중 조향 방향 계산 | ESP32 → **UART** |
+| **ESP32** | 센서 수집, 모드·우선순위 판단, 모터 토크 출력 | BLE / UART / I2C / PWM |
+| **TFmini · VL53L1X** | 전방·좌우 거리 측정 | UART / I2C |
+| **MDD10A · DC Motors** | 좌·우 조향 토크 발생 | PWM / DIR |
 
 ---
 
-## 🔑 Main Feature
+## 🎯 Main Features
 
-### 1. 목적지 기반 보행 방향 안내
+### 01 · 목적지 기반 보행 안내
 
-사용자가 Flutter App에서 목적지를 설정하면 TMAP을 이용하여 보행자 경로를 생성합니다.
-
-```text
-목적지 입력
-    ↓
-TMAP POI 검색
-    ↓
-보행자 경로 생성
-    ↓
-현재 위치 확인
-    ↓
-다음 경로점의 목표 방위각 계산
-    ↓
-스마트폰 현재 방향과 비교
-    ↓
-LEFT / RIGHT / FORWARD 판단
-    ↓
-BLE
-    ↓
-ESP32
-    ↓
-Motor Steering Torque
+```mermaid
+flowchart LR
+    A["목적지 입력<br/>STT / 검색"] --> B["TMAP 보행자 경로"]
+    B --> C["GPS 위치 + Compass 방향"]
+    C --> D["목표 방위각·방향 오차"]
+    D --> E["BLE 방향 명령"]
+    E --> F["ESP32 조향 토크"]
 ```
 
-목표 방향과 현재 진행 방향의 오차를 이용하여 사용자가 이동해야 할 방향을 결정합니다.
+- 사용자는 앱에서 목적지를 설정하고 보행자 경로를 안내받습니다.
+- **현재 진행 방향과 목표 방향의 차이**를 이용해 좌·우 조향 명령을 생성합니다.
+- **전진은 사용자**, 방향 안내는 모터의 **짧은 조향 펄스**가 담당합니다.
 
-Flutter에서 ESP32로 전달되는 주요 명령은 다음과 같습니다.
+### 02 · AI 횡단보도 및 신호등 인식
 
-```text
-B:<bearing>   목표 방위각
-L:<angle>     왼쪽 방향 유도
-R:<angle>     오른쪽 방향 유도
-F:<value>     직진 / 중립
-S:0           정지
-```
-
----
-
-### 2. AI 기반 보행 환경 인식
-
-Raspberry Pi와 카메라를 이용하여 실시간 보행 환경을 인식합니다.
-
-YOLO 기반 객체 인식 모델을 이용하여 주요 보행 환경 객체를 구분합니다.
-
-주요 인식 대상:
-
-```text
-Crosswalk
-Traffic Light
-Ground Light
-Tactile Paving
-Stairs
-```
-
-카메라 입력 영상은 Raspberry Pi에서 실시간으로 처리되며, 횡단보도가 일정 조건 이상 안정적으로 인식되면 일반 목적지 안내보다 **횡단보도 제어를 우선**합니다.
-
----
-
-### 3. 횡단보도 우선 제어
-
-Navis의 핵심 기능 중 하나는 횡단보도 상황에서 일반 GPS 경로 안내를 일시적으로 중단하고 **카메라 기반 횡단보도 제어로 전환하는 것**입니다.
-
-```text
-Normal Navigation
-       ↓
-Crosswalk Detection
-       ↓
-Crosswalk Mode ON
-       ↓
-Traffic Light Detection
-       ↓
-Crossing Start
-       ↓
-Crosswalk Direction Tracking
-       ↓
-LEFT / RIGHT Correction
-       ↓
-Crossing End
-       ↓
-Normal Navigation
-```
-
-이를 통해 횡단보도에서는 GPS의 목적지 방향보다 실제 카메라에서 확인되는 횡단보도 위치와 방향을 우선하여 사용자를 유도합니다.
-
----
-
-### 4. 신호등 인식
-
-Raspberry Pi에서는 YOLO를 통해 신호등 영역을 검출한 뒤 HSV 색상 분석을 이용하여 신호 상태를 판단합니다.
-
-```text
-Traffic Light Detection
-        ↓
-ROI Extraction
-        ↓
-HSV Color Analysis
-        ↓
-RED / GREEN
-        ↓
-Frame Stability Check
-        ↓
-Traffic Signal Decision
-```
-
-신호 상태는 UART를 통해 ESP32로 전달됩니다.
-
-```text
-LIGHT:RED
-LIGHT:GREEN
-LIGHT:NONE
-```
-
-빨간불이 확인되면 ESP32는 모터 출력을 정지시키고 안전 상태를 유지합니다.
-
----
-
-### 5. 횡단 중 방향 보정
-
-횡단이 시작된 이후에도 카메라 영상을 지속적으로 분석합니다.
-
-횡단보도의 위치 및 선 방향을 이용하여 현재 이동 방향이 횡단보도 진행 방향에서 벗어나고 있는지 판단합니다.
-
-```text
-Crosswalk ROI
-      ↓
-Image Processing
-      ↓
-Canny Edge Detection
-      ↓
-Hough Line Transform
-      ↓
-Crosswalk Angle Estimation
-      ↓
-EMA Filtering
-      ↓
-LEFT / RIGHT / CENTER
-```
-
-Raspberry Pi는 분석 결과에 따라 다음 메시지를 ESP32로 전송합니다.
-
-```text
-CROSS_MOTOR:L
-CROSS_MOTOR:R
-CROSS_MOTOR:CENTER
-```
-
-ESP32는 해당 명령에 따라 좌·우 모터에 조향 토크를 발생시킵니다.
-
-```text
-CROSS_MOTOR:L
-→ Left Steering Torque
-
-CROSS_MOTOR:R
-→ Right Steering Torque
-
-CROSS_MOTOR:CENTER
-→ Motor Neutral
-```
-
-이를 통해 사용자가 횡단 중 횡단보도의 진행 방향을 벗어나지 않도록 지속적으로 보조합니다.
-
----
-
-### 6. 전방 장애물 감지
-
-TFmini 거리 센서는 장치 전방에 고정되어 장애물과의 거리를 지속적으로 측정합니다.
-
-```text
-TFmini
-   ↓
-Distance Measurement
-   ↓
-30 cm 이하 3회 연속 감지
-   ↓
-Obstacle Confirmed
-   ↓
-Motor Stop
-   ↓
-Reverse Torque × 3
-```
-
-30 cm 이하의 장애물이 연속적으로 감지되면 ESP32는 장애물로 확정하고 양쪽 모터에 **역토크를 3회 발생**시켜 사용자에게 촉각적으로 위험을 전달합니다.
-
-장애물과의 거리가 40 cm 이상으로 증가하면 장애물 상태를 해제합니다.
-
-Flutter App에서는 100 cm 이내의 장애물을 화면에 표시하여 현재 장애물 거리를 확인할 수 있습니다.
-
----
-
-## 🔄 System Communication
-
-Navis의 전체 데이터 흐름은 다음과 같습니다.
-
-```text
-                    ┌─────────────────────┐
-                    │    Flutter App      │
-                    │                     │
-                    │ TMAP / GPS          │
-                    │ Compass / Voice     │
-                    └──────────┬──────────┘
-                               │
-                               │ BLE
-                               ▼
-                    ┌─────────────────────┐
-                    │       ESP32         │
-                    │                     │
-                    │ Central Controller  │
-                    │ Motor Control       │
-                    │ TFmini Processing   │
-                    └──────┬───────┬──────┘
-                           │       ▲
-                    PWM/DIR│       │UART
-                           ▼       │
-                       ┌───────┐   │
-                       │MDD10A │   │
-                       └───┬───┘   │
-                           │       │
-                           ▼       │
-                     Steering      │
-                      Motors       │
-                                   │
-                         ┌─────────┴─────────┐
-                         │   Raspberry Pi   │
-                         │                  │
-                         │ Camera + YOLO    │
-                         │ Crosswalk        │
-                         │ Traffic Light    │
-                         │ Direction        │
-                         └──────────────────┘
-
-TFmini ───────── UART ─────────▶ ESP32
-```
-
-### Communication Protocol
-
-| Communication | Connection |
+| 인식 대상 | 실제 활용 |
 |---|---|
-| Flutter ↔ ESP32 | BLE |
-| Raspberry Pi ↔ ESP32 | UART 115200 bps |
-| TFmini → ESP32 | UART 115200 bps |
-| ESP32 → MDD10A | PWM / Digital DIR |
+| **Crosswalk** | 횡단보도 접근 감지, 중앙·폭·각도 분석 |
+| **Traffic Light** | 보행 신호등 영역 탐지 및 RED/GREEN 판별 |
+| **Ground Light** | 국내 보행 환경의 바닥 신호등 인식 |
+| **Tactile Paving / Stairs** | 보행 환경 객체 인식 모델의 대상 |
+
+**신호 판별:** `YOLO 검출 → ROI 추출 → HSV 색상 점수 → 연속 프레임 안정화 → 신호 상태 확정`
+
+> **안전 조건:** 빨간불을 확인하지 못한 상태에서 초록불을 처음 인식하면, 남은 시간을 알 수 없으므로 `LIGHT:GREEN_WAIT`로 처리해 다음 신호를 기다립니다.
+
+### 03 · 횡단 중 방향 보정 **(핵심 기능)**
+
+```mermaid
+flowchart TD
+    A["횡단 시작"] --> B["YOLO 횡단보도 검출"]
+    B --> C{"박스 검출?"}
+    C -->|"YES"| D{"이탈·복귀 조건?"}
+    D -->|"YES"| E["횡단보도 방향으로 복귀"]
+    D -->|"NO"| F{"중심 편차 큼?"}
+    F -->|"YES"| G["박스 중심 기준 좌·우 보정"]
+    F -->|"NO"| H["Canny + Hough 선 각도 분석"]
+    H --> I["EMA + Hysteresis"]
+    I --> J["LEFT / RIGHT / CENTER"]
+    C -->|"NO"| K["직전 추세 확인"]
+    K --> L["근거가 있을 때만 짧은 복귀<br/>그 외 CENTER"]
+    E --> M["UART → ESP32"]
+    G --> M
+    J --> M
+    L --> M
+    M --> N["모터 조향 토크"]
+```
+
+**중앙 정렬과 각도 보정은 별개로 동작합니다.** 횡단보도가 화면 중심에서 크게 벗어나면 **중앙 복귀를 우선**하고, 중심이 안정적이면 줄무늬의 방향을 분석합니다. 흰색 엣지와 **노란색 HSV 엣지**를 결합하여 줄무늬 각도를 추정합니다.
+
+| 영상 기반 판단 | 조건 및 동작 |
+|---|---|
+| **중앙 정렬** | 중심 편차 진입 **12%**, 해제 **6%** |
+| **각도 보정** | 각도 진입 **3°**, 해제 **2°** · EMA 필터 |
+| **이탈 감지 활성화** | 횡단보도 박스 폭 **60% 이상, 연속 2프레임** |
+| **이탈 복귀** | 박스 폭 **35% 이하** + 좌우 편차 확인 **2프레임** |
+| **복귀 해제** | 박스 폭 **50% 이상** 또는 중앙 복귀 조건 확인 |
+| **검출 소실 복귀** | 직전 폭 감소·한쪽 이동 추세가 있을 때만 **최대 0.6초 또는 2프레임** |
+| **횡단 종료 판단** | **20개 추론 프레임** 연속 미검출 → `CROSSING_END` 약 **0.5초** 유지 |
+
+> 위 프레임 수는 카메라 FPS가 아니라 **실제 AI 추론 결과의 개수**입니다. 검출이 끊겼다고 임의의 방향으로 계속 조향하지 않도록 복귀 시간과 횟수를 제한합니다.
+
+### 04 · 전방 장애물 감지 및 촉각 경고
+
+```mermaid
+flowchart LR
+    A["TFmini 거리 측정"] --> B{"위험 거리<br/>연속 감지?"}
+    B -->|"YES"| C["안전 제어 우선"]
+    C --> D["양쪽 모터 역토크 × 3"]
+    D --> E["사용자 촉각 경고"]
+    B -->|"NO"| F["일반 조향 유지"]
+```
+
+- 장애물이 가까워지면 **모터 역토크 3회**로 위험을 전달합니다.
+- 장애물 감지·해제에는 **서로 다른 거리 기준(히스테리시스)**을 사용합니다.
+- 앱에서는 전방 거리 및 장애물 상태를 확인할 수 있습니다.
+
+**주의:** 장애물 감지 거리, 복귀 거리 등 최종 임계값은 배포한 ESP32 펌웨어 버전을 기준으로 확인해야 합니다.
 
 ---
 
 ## 🛡️ Control Priority
 
-여러 입력이 동시에 발생하는 경우 안전 및 보행 상황에 따라 제어 우선순위를 적용합니다.
-
-```text
-Obstacle / Safety
-        ↓
-Traffic Signal
-        ↓
-Crosswalk Steering
-        ↓
-Normal Navigation
+```mermaid
+flowchart TD
+    A["센서 · 영상 · 앱 명령 수신"] --> B{"전방 장애물 / 안전 이벤트?"}
+    B -->|"YES"| C["① 장애물 안전 제어"]
+    B -->|"NO"| D{"횡단보도 / 신호 상태?"}
+    D -->|"신호 대기"| E["② 신호등 상태 제어"]
+    D -->|"횡단 중"| F["③ 카메라 기반 조향"]
+    D -->|"일반 보행"| G["④ Flutter 내비게이션 조향"]
 ```
 
-횡단보도 모드에서는 Flutter의 일반 목적지 방향 명령을 제한하고 Raspberry Pi의 횡단보도 방향 판단 결과를 우선적으로 사용합니다.
-
-횡단이 종료되면 다시 Flutter 기반 일반 길안내 모드로 복귀합니다.
-
----
-
-## ⚙️ Technology Environment
-
-### Embedded
-
-![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-C51A4A?logo=raspberrypi&logoColor=white)
-![ESP32](https://img.shields.io/badge/ESP32-E7352C?logo=espressif&logoColor=white)
-![Arduino](https://img.shields.io/badge/Arduino-00878F?logo=arduino&logoColor=white)
-
-### Computer Vision & AI
-
-![YOLO](https://img.shields.io/badge/YOLO-111F68?logo=yolo&logoColor=white)
-![OpenCV](https://img.shields.io/badge/OpenCV-5C3EE8?logo=opencv&logoColor=white)
-![Ultralytics](https://img.shields.io/badge/Ultralytics-111F68?logo=ultralytics&logoColor=white)
-![NumPy](https://img.shields.io/badge/NumPy-013243?logo=numpy&logoColor=white)
-
-### Mobile Application
-
-![Flutter](https://img.shields.io/badge/Flutter-02569B?logo=flutter&logoColor=white)
-![Dart](https://img.shields.io/badge/Dart-0175C2?logo=dart&logoColor=white)
-
-### Programming Language
-
-![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)
-![C++](https://img.shields.io/badge/C++-00599C?logo=cplusplus&logoColor=white)
-![Dart](https://img.shields.io/badge/Dart-0175C2?logo=dart&logoColor=white)
-
-### Navigation & Map
-
-![TMAP](https://img.shields.io/badge/TMAP-Navigation-red)
-![OpenStreetMap](https://img.shields.io/badge/OpenStreetMap-7EBC6F?logo=openstreetmap&logoColor=white)
-
-### Communication
-
-![BLE](https://img.shields.io/badge/BLE-Bluetooth-0082FC?logo=bluetooth&logoColor=white)
-![UART](https://img.shields.io/badge/UART-Serial%20Communication-orange)
-
-### Development Environment
-
-![VS Code](https://img.shields.io/badge/VS%20Code-007ACC?logo=visualstudiocode&logoColor=white)
-![Arduino IDE](https://img.shields.io/badge/Arduino%20IDE-00878F?logo=arduino&logoColor=white)
-![Git](https://img.shields.io/badge/Git-F05032?logo=git&logoColor=white)
-![GitHub](https://img.shields.io/badge/GitHub-181717?logo=github&logoColor=white)
-
----
-
-## 🔧 Hardware
-
-| Hardware | Role |
-|---|---|
-| Raspberry Pi | AI 영상 처리 및 횡단보도 판단 |
-| Camera Module | 실시간 보행환경 영상 입력 |
-| ESP32 | 통신 및 전체 제어 |
-| MDD10A | 좌·우 DC Motor 제어 |
-| DC Motor ×2 | 조향 토크 생성 |
-| TFmini | 전방 장애물 거리 측정 |
-| Smartphone | 목적지 설정 및 사용자 인터페이스 |
-| Battery | 전체 시스템 전원 공급 |
-
----
-
-## 📂 File Architecture
-
-### SW File Architecture
-
-```text
-Navis/
-│
-├── docs/
-│   └── [images and documentation]
-│
-├── esp32/
-│   ├── README.md
-│   └── navis_esp32.ino
-│
-├── raspberry_pi/
-│   ├── best_ncnn_model/
-│   ├── README.md
-│   └── main.py
-│
-├── flutter_app/
-│   ├── android/
-│   ├── ios/
-│   ├── lib/
-│   │   └── main.dart
-│   ├── README.md
-│   ├── analysis_options.yaml
-│   ├── pubspec.yaml
-│   └── pubspec.lock
-│
-└── README.md
-```
-
-## ESP32
-
-```text
-esp32/
-├── README.md
-└── navis_esp32.ino
-```
-
-주요 기능:
-
-- BLE Server
-- Flutter 명령 처리
-- Raspberry Pi UART 처리
-- TFmini 거리 측정
-- MDD10A 모터 제어
-- 장애물 역토크 경고
-- 횡단보도 조향 제어
-
-## Raspberry Pi
-
-```text
-raspberry_pi/
-├── best_ncnn_model/
-├── README.md
-└── main.py
-```
-
-주요 기능:
-
-- Camera 입력
-- YOLO 기반 보행환경 인식
-- 횡단보도 인식
-- 신호등 인식
-- HSV 신호 색상 판단
-- 횡단보도 방향 분석
-- ESP32 UART 통신
-
-
-## Flutter App
-
-```text
-
-flutter_app/
-
-├── android/
-
-├── ios/
-
-├── lib/
-
-│   └── main.dart
-
-├── README.md
-
-├── analysis_options.yaml
-
-├── pubspec.lock
-
-└── pubspec.yaml
-```
-
-주요 기능:
-
-- 현재 위치 및 목적지 표시
-- TMAP 기반 보행 경로 탐색
-- 음성 목적지 입력
-- TTS 음성 안내
-- ESP32 BLE 연결
-- 좌·우 조향 명령 전송
-- 현재 방향 및 목표 방향 계산
-- 장애물 감지 상태 표시
-- 시스템 상태 UI 표시
+횡단 중에는 일반 GPS 조향보다 **Raspberry Pi의 횡단보도 보정 명령**을 우선합니다. Raspberry Pi는 횡단 중 조향 명령을 **0.3초 간격으로 재전송**하며, ESP32는 오래된 횡단 조향 명령이 유지되지 않도록 수신 시간 제한을 적용합니다.
 
 ---
 
 ## 📡 Communication Protocol
 
-### Raspberry Pi → ESP32
+| 방향 | 주요 메시지 | 의미 |
+|---|---|---|
+| **Flutter → ESP32** | `L:<angle>` / `R:<angle>` | 좌·우 방향 유도 |
+| | `F:<value>` / `S:0` / `B:<bearing>` | 직진·정지·목표 방위각 |
+| **Pi → ESP32** | `CROSSWALK:1/0` | 횡단보도 감지 여부 |
+| | `LIGHT:RED/GREEN/GREEN_WAIT` | 신호 상태 |
+| | `CROSSING_START` / `CROSSING_END` | 횡단 시작·종료 |
+| | `CROSS_MOTOR:L/R/CENTER` | 횡단 중 조향 방향 |
+| **ESP32 → Flutter** | `DIST:<cm>` / `SIDE:<left>,<right>` | 거리 센서 값 |
+| | `OBSTACLE:<cm>` / `OBSTACLE_CLEAR` | 장애물 경고·해제 |
+| | `AVOID:L/R/BLOCKED` | 장애물 회피 상태 |
+| | `MOTOR:L/R/STOP` | 모터 상태 |
+
+- **BLE 장치명:** `SMART_CANE`
+- **UART 통신 속도:** `115200 bps`
+- 상세 구현은 [`esp32/README.md`](./esp32/README.md), [`raspberry_pi/README.md`](./raspberry_pi/README.md), [`flutter_app/README.md`](./flutter_app/README.md) 참고
+
+---
+
+## 🧰 Hardware & Tech Stack
+
+### Hardware
+
+| 구분 | 부품 | 용도 |
+|---|---|---|
+| Vision | Raspberry Pi 4 + Camera Module | AI 영상 추론 |
+| Control | ESP32 | 센서·통신·모터 제어 |
+| Distance | TFmini + VL53L1X × 2 | 전방·측면 거리 측정 |
+| Actuation | MDD10A + DC Motor × 2 | 좌·우 조향 토크 |
+| Interface | Smartphone | 목적지 입력·상태 확인 |
+| Power | Battery | 시스템 전원 공급 |
+
+### Software
+
+| 영역 | 기술 |
+|---|---|
+| **AI / Vision** | Python · Ultralytics YOLO · NCNN · OpenCV · NumPy |
+| **Navigation / App** | Flutter · Dart · TMAP · OpenStreetMap · GPS · Compass |
+| **Embedded** | ESP32 · Arduino C++ · PWM · UART · I2C · BLE |
+| **Development** | VS Code · Arduino IDE · Git · GitHub |
+
+---
+
+## 📁 Repository Structure
 
 ```text
-CROSSWALK:1
-CROSSWALK:0
-
-LIGHT:RED
-LIGHT:GREEN
-LIGHT:NONE
-
-CROSSING_START
-CROSSING_END
-
-CROSS_MOTOR:L
-CROSS_MOTOR:R
-CROSS_MOTOR:CENTER
+NAVIS/
+├── docs/
+│   └── hardware.png
+├── esp32/
+│   ├── navis_esp32.ino
+│   └── README.md
+├── raspberry_pi/
+│   ├── best3_ncnn_model/
+│   ├── main.py
+│   └── README.md
+├── flutter_app/
+│   ├── lib/main.dart
+│   ├── android/
+│   ├── ios/
+│   ├── pubspec.yaml
+│   └── README.md
+└── README.md
 ```
 
-### Flutter → ESP32
+### 실행 안내
 
-```text
-B:<bearing>
-L:<angle>
-R:<angle>
-F:<value>
-S:0
-```
-
-### ESP32 → Flutter
-
-```text
-DIST:<cm>
-
-OBSTACLE:<cm>
-OBSTACLE_CLEAR
-
-CROSSWALK:1
-CROSSWALK:0
-
-LIGHT:RED
-LIGHT:GREEN
-LIGHT:NONE
-
-CROSSING_START
-CROSSING_END
-
-CROSS_MOTOR:L
-CROSS_MOTOR:R
-CROSS_MOTOR:CENTER
-```
-
-## 🍓 Raspberry Pi Execution
-
-Main file:
-
-```text
-raspberry_pi/main.py
-```
-
-주요 Python Package:
-
-```text
-ultralytics
-opencv-python
-numpy
-pyserial
-picamera2
-```
-
-실행:
+| 시스템 | 실행 방법 |
+|---|---|
+| **Raspberry Pi** | `cd raspberry_pi && python3 main.py` · Picamera2, OpenCV, NumPy, Ultralytics, PySerial 및 NCNN 모델 필요 |
+| **ESP32** | Arduino IDE에서 `esp32/navis_esp32.ino` 업로드 · 보드 및 포트 설정 |
+| **Flutter** | `cd flutter_app && flutter pub get` 후 아래 명령 실행 |
 
 ```bash
-python3 main.py
+flutter run --dart-define=TMAP_APP_KEY=YOUR_TMAP_APP_KEY
 ```
 
-AI Model:
-
-```text
-best_ncnn_model
-```
+> Raspberry Pi의 모델 경로(`best3_ncnn_model`)와 UART 포트(`/dev/ttyS0`)는 실제 연결 환경에 맞춰 확인해야 합니다. TMAP API 키는 저장소에 직접 포함하지 않습니다.
 
 ---
 
-## ⚙️ ESP32 Firmware
+## 🎬 Demo Video
 
-Main file:
+<div align="center">
 
-```text
-esp32/navis_esp32.ino
-```
+[![NAVIS Demo Video](https://img.youtube.com/vi/FR7wWThx7Qo/hqdefault.jpg)](https://youtu.be/FR7wWThx7Qo)
 
-ESP32는 Arduino IDE를 이용하여 빌드 및 업로드합니다.
+**[▶ NAVIS 시연 영상 재생](https://youtu.be/FR7wWThx7Qo)**
 
-주요 제어값:
+</div>
 
-```text
-BLE Device Name : SMART_CANE
-UART Baud Rate  : 115200
-
-Obstacle Detect : 30 cm
-Obstacle Reset  : 40 cm
-
-Reverse Torque  : 3 times
-```
+**시연 포인트:** `목적지 안내` · `횡단보도 및 바닥 신호등 인식` · `횡단 중 중앙·각도 보정` · `이탈 복귀` · `장애물 역토크 경고`
 
 ---
 
-## 🎥 Video
+## 👥 Team Members
 
-### Demo Video
-
-NAVIS의 주요 기능 및 실제 동작을 확인할 수 있는 시연 영상입니다.
-
-[![NAVIS Demo Video](https://img.youtube.com/vi/FR7wWThx7Qo/maxresdefault.jpg)](https://youtu.be/FR7wWThx7Qo)
-
-**▶ 위 이미지를 클릭하면 NAVIS 시연 영상으로 이동합니다.**
-
----
-
-## ✨ Key Differentiation
-
-기존 보행 보조 시스템이 주변 상황을 감지한 후 음성 또는 진동으로 정보를 전달하는 방식에 집중했다면, Navis는 **인식된 주변 환경과 목적지 방향을 바탕으로 사용자가 이동해야 할 방향을 시스템이 판단하고 모터 조향 토크를 통해 직접 전달**합니다.
-
-특히 횡단보도에서는 일반 목적지 경로보다 실제 횡단보도 환경을 우선하여,
-
-```text
-횡단보도 인식
-      ↓
-신호등 판단
-      ↓
-횡단 시작
-      ↓
-횡단보도 방향 추정
-      ↓
-좌·우 조향 보정
-      ↓
-횡단 종료
-```
-
-의 전체 과정을 연속적으로 수행합니다.
-
-이를 통해 단순한 **환경 인식 및 알림**에서 나아가 **상황 판단과 실제 이동 방향 보조까지 수행하는 반자율 보행 보조 시스템**을 구현하였습니다.
-
----
-
-## 🎯 Project Goal
-
-Navis는 다음 기술을 하나의 시스템으로 통합하는 것을 목표로 합니다.
-
-**AI Vision + Navigation + Sensor + Communication + Motor Steering Guidance**
-
-이를 통해 시각장애인이 목적지까지 이동하는 일반적인 보행 과정뿐만 아니라 횡단보도와 같은 위험도가 높은 보행 환경에서도 보다 직관적으로 이동 방향을 인지할 수 있도록 지원합니다.
-
----
-
-## 🧑‍🤝‍🧑 Team Member
-
-| **팀원** | **담당 역할** |
+| 팀원 | 담당 역할 |
 |---|---|
-| 조혜은 (팀장) | 프로젝트 총괄, ESP32 펌웨어 개발, 모터 제어 알고리즘 설계 및 구현, 회로 설계 및 HW 제작 |
-| 조성원 | Raspberry Pi 기반 AI 영상처리, YOLO 모델 학습 및 객체인식 |
-| 이소이 | 거리 센서 제어 및 연동, Flutter App 기능·UI 구현 |
-| 한채원 | 3D 모델링 및 프린팅, 회로 설계 및 HW·하네스 제작 |
+| **조혜은 (팀장)** | 프로젝트 총괄, ESP32 펌웨어, 모터 제어 알고리즘, 회로 설계·HW 제작 |
+| **조성원** | Raspberry Pi AI 영상처리, YOLO 모델 학습 및 객체 인식 |
+| **이소이** | 거리 센서 제어·연동, Flutter App 기능 및 UI |
+| **한채원** | 3D 모델링·프린팅, 회로 설계, HW·하네스 제작 |
 
 ---
 
 ## 🏆 Embedded Software Contest
 
-This project was developed for an embedded software competition.
+**NAVIS — AI-based Semi-Autonomous Walking Assistance System**
 
-**Navis — AI-based Semi-Autonomous Walking Assistance System**
+본 프로젝트는 임베디드 소프트웨어 경진대회 출품을 위해 개발되었습니다.
+
+> **안전 안내:** NAVIS는 연구·시연용 프로토타입입니다. 영상 인식과 센서 판단만으로 실제 도로 횡단의 안전을 보장하지 않으며, 시연은 통제된 환경에서 안전관리자 감독하에 수행해야 합니다.
