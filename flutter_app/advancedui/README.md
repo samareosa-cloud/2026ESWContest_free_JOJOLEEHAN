@@ -2,6 +2,10 @@
 
 시각장애인용 스마트 지팡이(ESP32)와 블루투스로 연결해 음성으로 길을 안내하는 Flutter 앱입니다.
 
+<p>
+  <img src="../../docs/hardware.png" width="540" alt="스마트 지팡이 하드웨어">
+</p>
+
 ## 주요 기능
 
 - **음성 길 안내**: 목적지를 말하면 경로를 찾아 남은 거리와 방향을 음성으로 알려 줍니다.
@@ -19,8 +23,8 @@
 ### 사용자 화면 (시각장애인용)
 
 <p>
-  <img src="docs/screenshots/user_navigation.jpg" width="260" alt="사용자 화면 - 길 안내 중">
-  <img src="docs/screenshots/user_listening.jpg" width="260" alt="사용자 화면 - 음성 듣는 중">
+  <img src="../../docs/user_navigation.jpg" width="260" alt="사용자 화면 - 길 안내 중">
+  <img src="../../docs/user_listening.jpg" width="260" alt="사용자 화면 - 음성 듣는 중">
 </p>
 
 버튼 없이 화면 어디를 눌러도 됩니다.
@@ -38,8 +42,8 @@
 ### 보호자 화면
 
 <p>
-  <img src="docs/screenshots/guardian_destination.jpg" width="260" alt="보호자 화면 - 목적지와 조작 버튼">
-  <img src="docs/screenshots/guardian_map.jpg" width="260" alt="보호자 화면 - 지도와 길 안내 정보">
+  <img src="../../docs/guardian_destination.jpg" width="260" alt="보호자 화면 - 목적지와 조작 버튼">
+  <img src="../../docs/guardian_map.jpg" width="260" alt="보호자 화면 - 지도와 길 안내 정보">
 </p>
 
 - 지도와 보행 경로를 보여 줍니다.
@@ -58,6 +62,6 @@
 ## 구성
 
 - `flutter_app/` : Flutter 앱 (`lib/main.dart`)
-- `esp32/navis_esp32_rtos/` : 지팡이 펌웨어 (FreeRTOS)
+- `esp32/` : 지팡이 펌웨어 (FreeRTOS)
 - `raspberry_pi/` : 신호등 인식
-- `docs/screenshots/` : 앱 화면 사진
+- `docs/` : 앱 화면 / 하드웨어 사진
