@@ -17,6 +17,12 @@
 ## 화면
 
 ### 사용자 화면 (시각장애인용)
+
+<p>
+  <img src="docs/screenshots/user_navigation.jpg" width="260" alt="사용자 화면 - 길 안내 중">
+  <img src="docs/screenshots/user_listening.jpg" width="260" alt="사용자 화면 - 음성 듣는 중">
+</p>
+
 버튼 없이 화면 어디를 눌러도 됩니다.
 
 | 동작 | 기능 |
@@ -25,14 +31,20 @@
 | 길게 누르기 (0.8초) | 말하기 (목적지 / 명령) |
 | 두 번 탭 | 길 안내 중지 |
 
-- 검은 배경에 큰 글자를 써서 저시력 사용자도 볼 수 있습니다.
+- 검은 배경에 큰 글자를 쓰고, 상태에 따라 테두리 색이 바뀝니다.
 - 동작마다 진동 세기가 다릅니다.
 - "사용법"이라고 말하면 사용법을 다시 알려 줍니다.
 
 ### 보호자 화면
-- 지도, 경로, 센서 값, 신호 인식 결과를 보여 줍니다.
-- 지팡이 연결 상태를 보여 줍니다.
-- 안전 상태 요약(GPS 정확도, 나침반, 남은 거리 등)을 보여 줍니다.
+
+<p>
+  <img src="docs/screenshots/guardian_destination.jpg" width="260" alt="보호자 화면 - 목적지와 조작 버튼">
+  <img src="docs/screenshots/guardian_map.jpg" width="260" alt="보호자 화면 - 지도와 길 안내 정보">
+</p>
+
+- 지도와 보행 경로를 보여 줍니다.
+- 길 안내 정보(나침반, 목표 방위각, 경로선과 거리, 남은 거리)를 보여 줍니다.
+- 지팡이 연결 상태와 안전 상태 요약을 보여 줍니다.
 - 사용자 화면 오른쪽 위 `보호자 화면` 버튼으로 들어갑니다.
 
 ## 실행 방법
@@ -47,3 +59,5 @@
 
 - `flutter_app/` : Flutter 앱 (`lib/main.dart`)
 - `esp32/navis_esp32_rtos/` : 지팡이 펌웨어 (FreeRTOS)
+- `raspberry_pi/` : 신호등 인식
+- `docs/screenshots/` : 앱 화면 사진
