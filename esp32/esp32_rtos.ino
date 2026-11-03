@@ -6,39 +6,26 @@
 #include <VL53L1X.h>
 #include <atomic>
 #include <stdarg.h>
+#include <esp_arduino_version.h>
+
+// ledcAttach(pin, freq, bits) / 핀 번호 ledcWrite()는 Arduino-ESP32 3.x API
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || ESP_ARDUINO_VERSION_MAJOR < 3
+#error "Arduino-ESP32 core 3.x 이상이 필요합니다. (보드 매니저에서 esp32 3.x 설치)"
+#endif
 
 
 // =====================================================
-// NAVIS ESP32 - FreeRTOS 버전
+// NAVIS ESP32 - FreeRTOS
 //
-// 기존 navis_esp32.ino(슈퍼루프)를 태스크 구조로 나눈 버전.
-// 핀, BLE/UART 메시지 프로토콜, 동작 파라미터는 기존과 같다.
-//
-// 태스크 구성 (전부 core 1, BLE 스택은 core 0에서 따로 돈다)
-//
-//  우선순위 5  obstacleTask    TFmini 10ms 주기, 장애물 확정/해제 판단
-//  우선순위 4  motorTask       모터를 만지는 "유일한" 태스크
-//                              장애물 회피 / 횡단보도 / 신호 상태를 모두 소유
-//  우선순위 3  piUartTask      Raspberry Pi 줄 단위 수신 -> 이벤트
-//  우선순위 2  bleTxTask       BLE notify 전송 전담
-//  우선순위 1  sideSensorTask  VL53L1X 좌/우 측정 (I2C 전담)
-//
-//  BLE RX 콜백(BLE 스택 태스크)은 명령을 파싱해서 큐에 넣기만 한다.
-//
-// 기존 코드와 가장 큰 차이
-//  1) 모터 제어가 motorTask 한 곳으로 모였다.
-//     기존에는 BLE 콜백(guideLeft 등)과 loop(역토크 등)가
-//     서로 다른 태스크에서 동시에 ledcWrite를 할 수 있었다.
-//  2) 장애물 확정은 진행 중인 길안내 / 빨간불 역토크를 바로 끊는다.
-//     기존에는 역토크 delay 동안 TFmini를 아예 읽지 못했다.
-//  3) TFmini를 항상 10ms마다 읽기 때문에 flushTFmini()가 필요 없다.
+//  우선순위 5  obstacleTask    TFmini 10ms 주기, 정면 상태 판단
+//  우선순위 4  motorTask       모터를 만지는 유일한 태스크
+//  우선순위 3  piUartTask      Raspberry Pi 수신
+//  우선순위 2  bleTxTask       BLE notify 전송
+//  우선순위 1  sideSensorTask  VL53L1X 좌/우 측정
 // =====================================================
 
 
-// =====================================================
 // MDD10A
-// =====================================================
-
 #define M1_DIR 25
 #define M1_PWM 27
 
@@ -46,31 +33,14 @@
 #define M2_PWM 14
 
 
-// =====================================================
-// TFmini
-//
-// TFmini TX(초록) -> ESP32 GPIO16
-// TFmini RX(흰색)  -> GPIO17 (현재는 연결 안 해도 됨)
-// =====================================================
-
+// TFmini TX -> GPIO16
 #define TF_RX 16
 #define TF_TX 17
 
 HardwareSerial TFSerial(2);
 
 
-// =====================================================
-// VL53L1X LEFT / RIGHT
-//
-// 두 센서는 기본 I2C 주소가 0x29로 같기 때문에
-// XSHUT으로 하나씩 켜서 주소를 바꿔 사용한다.
-//
-// LEFT  XSHUT -> GPIO23, address 0x30
-// RIGHT XSHUT -> GPIO26, address 0x31
-// SDA -> GPIO21 (공유)
-// SCL -> GPIO22 (공유)
-// =====================================================
-
+// VL53L1X: 기본 주소(0x29)가 같아서 XSHUT으로 하나씩 켜고 주소를 바꾼다.
 #define I2C_SDA 21
 #define I2C_SCL 22
 
@@ -87,25 +57,12 @@ bool vlLeftOK = false;
 bool vlRightOK = false;
 
 
-// =====================================================
-// Raspberry Pi UART
-//
-// Raspberry Pi TX -> ESP32 GPIO18
-// Raspberry Pi RX <- ESP32 GPIO19
-//
-// ESP32와 Raspberry Pi GND 반드시 공통
-// =====================================================
-
+// Raspberry Pi TX -> GPIO18, RX <- GPIO19 (GND 공통)
 #define PI_RX 18
 #define PI_TX 19
 
 HardwareSerial PiSerial(1);
 
-
-// =====================================================
-// BLE UUID
-// Flutter 앱과 반드시 같아야 함
-// =====================================================
 
 #define SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 #define RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -115,38 +72,32 @@ BLECharacteristic* txCharacteristic = nullptr;
 
 
 // =====================================================
-// 장애물 설정
-//
-// 앱:
-// 100cm 이하 -> 화면에 "장애물 감지"
-//
-// ESP32:
-// 40cm 이하 -> 역토크 3회
-// 50cm 이상 -> 다시 장애물 감지 가능
+// 장애물
 // =====================================================
 
 const int OBSTACLE_DISTANCE = 40;
 const int RESET_DISTANCE = 50;
 
-// TFmini 40cm 이하가 3회 연속 들어와야 실제 장애물로 판단
-const int OBSTACLE_CONFIRM_COUNT = 3;
+const int OBSTACLE_CONFIRM_COUNT = 3;   // 40cm 이하 연속 횟수
+const int CLEAR_CONFIRM_COUNT = 3;      // 50cm 이상 연속 횟수
+const int OBSTACLE_GAP_RESET_MS = 50;   // 유효 측정이 이만큼 끊기면 연속 횟수 초기화
 
-// 좌/우 VL53L1X 판단 기준
+// TFmini 신호 세기가 이보다 낮거나 65535(과노출)면 거리를 믿지 않는다.
+const int TF_MIN_STRENGTH = 100;
+const int TF_STALE_MS = 300;            // 프레임이 안 옴
+const int TF_INVALID_LOST_MS = 1000;    // 프레임은 오는데 유효 거리가 없음
+const int TF_LOST_REPEAT_MS = 3000;
+
+const int OBSTACLE_NOTIFY_DELAY_MS = 50;
+const int OBSTACLE_SETTLE_MS = 100;
+
 const int SIDE_BLOCK_DISTANCE = 30;
 const int DIRECTION_MARGIN = 20;
 
-
-// =====================================================
-// 장애물 회피 유도
-//
-// 역토크 후 고른 방향(좌/우)으로, 정면이 트일 때
-// (TFmini RESET_DISTANCE 이상)까지 계속 당겨 준다.
-// =====================================================
-
-const int AVOID_PWM = 120;          // 장애물 회피: 강한 방향 유도
-const int AVOID_PULSE_TIME = 400;   // 한 번 당기는 시간 (ms)
-const int AVOID_REPEAT_MS = 900;    // 당김 시작 간격 (ms)
-const int AVOID_MAX_PULSES = 8;     // 이만큼 당겨도 정면이 막혀 있으면 "길 막힘"
+const int AVOID_PWM = 120;
+const int AVOID_PULSE_TIME = 400;
+const int AVOID_REPEAT_MS = 900;
+const int AVOID_MAX_PULSES = 8;
 
 enum AvoidState {
   AVOID_NONE,
@@ -157,90 +108,66 @@ enum AvoidState {
 
 
 // =====================================================
-// 모터 PWM 램프업 설정
-// 모든 모터 동작 시작 시 0 -> 목표 PWM으로 약 100ms 동안 증가
+// 모터
 // =====================================================
 
 const int MOTOR_RAMP_TIME_MS = 100;
 const int MOTOR_RAMP_STEPS = 5;
 
-
-// =====================================================
-// 방향 유도 모터 설정
-// =====================================================
-
 const int GUIDE_PWM = 100;
 const int GUIDE_TIME = 250;
 
-
-// =====================================================
-// 역토크 설정
-// =====================================================
-
 const int BRAKE_PWM = 100;
-
 const int BRAKE_ON_TIME = 300;
 const int BRAKE_OFF_TIME = 200;
-
 const int BRAKE_COUNT = 3;
-
-// 빨간불로 바뀌면 역토크를 이 횟수만큼 줘서 "멈추세요"를 몸으로 알린다.
-// (장애물 경고 3회와 구분되도록 2회)
 const int RED_BRAKE_COUNT = 2;
 
-
-// =====================================================
-// 횡단 중 방향 보정 (Raspberry Pi CROSS_MOTOR:L/R/CENTER)
-//
-// "펄스" 방식:
-//  - Pi가 L/R을 보내면 딱 한 번만 당긴다. (스스로 반복하지 않음)
-//  - Pi가 STEER_PULSE_SEC 뒤에 CENTER를 보내면 바로 멈춘다.
-//  - CROSS_PULSE_MAX_TIME: CENTER를 못 받았을 때 대비한 안전 상한.
-//  - CROSS_TIMEOUT_MS 동안 Pi 소식이 없으면 스스로 멈춘다.
-// =====================================================
-
 const int CROSS_PWM = 110;
-const int CROSS_PULSE_MAX_TIME = 300;  // 램프업 이후 최대 유지 시간 (ms)
-const int CROSS_TIMEOUT_MS = 1000;     // Pi 메시지 끊김 판단 (ms)
+const int CROSS_PULSE_MAX_TIME = 300;
+const int CROSS_TIMEOUT_MS = 1000;
+const int CROSS_CMD_MAX_AGE_MS = 100;   // 이보다 늦게 처리되는 CROSS_MOTOR:L/R은 버린다.
+
+// 횡단 중 / 횡단 종료 후 이 시간 안에 본 빨간불은 바로 멈추게 하지 않고 보류한다.
+// 유예가 끝났는데 다시 건너는 중이 아니고 초록불도 없으면 그때 빨간불로 처리한다.
+const int CROSSING_RED_GRACE_MS = 3000;
 
 
 // =====================================================
-// FreeRTOS 설정
+// FreeRTOS
 // =====================================================
 
 #define APP_CORE 1
 
-const int OBSTACLE_PERIOD_MS = 10;   // TFmini 확인 주기 (TFmini 기본 출력 100Hz)
-const int MOTOR_TICK_MS = 10;        // motorTask 타이머(펄스 종료 등) 확인 주기
-const int PI_POLL_MS = 5;            // Pi UART 확인 주기
-const int SIDE_POLL_MS = 20;         // VL53L1X dataReady 확인 주기
-const int SIDE_STALE_MS = 300;       // 이 시간 동안 새 값이 없으면 -1 (읽기 실패)
-const int REPORT_MS = 300;           // 앱으로 DIST / SIDE 보내는 주기
+const int OBSTACLE_PERIOD_MS = 10;
+const int MOTOR_TICK_MS = 10;
+const int PI_POLL_MS = 5;
+const int SIDE_POLL_MS = 20;
+const int SIDE_STALE_MS = 300;
+const int REPORT_MS = 300;
+const int ADVERTISE_RESTART_DELAY_MS = 200;
 
-const int MOTOR_QUEUE_LEN = 32;      // 역토크(최대 약 1.8초) 동안 쌓일 이벤트까지 여유 있게
-const int BLE_TX_QUEUE_LEN = 20;
+const int MOTOR_QUEUE_LEN = 32;
+const int BLE_ALERT_QUEUE_LEN = 24;   // 장애물·신호·상태 알림
+const int BLE_REPORT_QUEUE_LEN = 4;   // DIST / SIDE / Pi 기타 메시지 (밀리면 버려도 됨)
+const int BLE_MAX_PAYLOAD = 20;       // 기본 MTU(23) - 3
+const int LOG_QUEUE_LEN = 32;
+const int PI_PENDING_LEN = 16;
+const int PI_LINE_MAX = 100;
 
-// 1이면 5초마다 TFmini 확인 주기 최대값과 태스크별 남은 스택을 출력한다.
-// 리팩토링 전후 비교 / 스택 크기 조정용.
 #define DEBUG_MONITOR 1
 
-
-// =====================================================
-// 태스크 사이에서 주고받는 데이터
-// =====================================================
 
 enum EventType : uint8_t {
 
   // obstacleTask -> motorTask
-  EV_OBSTACLE_CONFIRMED,
-  EV_OBSTACLE_CLEAR,
+  EV_FRONT_STATE,
 
-  // Flutter(BLE) -> motorTask
+  // Flutter -> motorTask (S / 연결 해제는 requestStop)
   EV_APP_LEFT,
   EV_APP_RIGHT,
   EV_APP_FORWARD,
-  EV_APP_STOP,
-  EV_APP_DISCONNECTED,
+  EV_APP_STATE_REQUEST,
 
   // Raspberry Pi -> motorTask
   EV_PI_CROSSWALK_ON,
@@ -255,77 +182,101 @@ enum EventType : uint8_t {
   EV_PI_CROSS_CENTER
 };
 
+// EV_FRONT_STATE flags
+const uint8_t FRONT_LOST = 1 << 0;
+const uint8_t FRONT_OBSTACLE = 1 << 1;
+
 struct MotorEvent {
   EventType type;
-  float value;        // 앱 L/R 각도, 장애물 거리(cm)
-  uint32_t stampUs;   // 이벤트를 만든 시각 (반응 지연 측정용)
+  float value;          // 앱 L/R 각도, 정면 거리(cm)
+  uint32_t stampUs;
+  uint32_t seq;         // 정면 상태 번호 / 앱 명령 번호
+  uint32_t obstacleId;  // EV_FRONT_STATE: 장애물마다 1씩 증가
+  uint8_t flags;        // EV_FRONT_STATE
 };
 
 struct BleMsg {
-  char text[104];     // Pi 메시지(최대 100자)를 그대로 전달할 수 있는 크기
+  char text[PI_LINE_MAX + 4];
 };
 
 QueueHandle_t motorQueue = nullptr;
-QueueHandle_t bleTxQueue = nullptr;
-SemaphoreHandle_t logMutex = nullptr;
+QueueHandle_t bleAlertQueue = nullptr;
+QueueHandle_t bleReportQueue = nullptr;
+QueueHandle_t logQueue = nullptr;
 
 TaskHandle_t obstacleTaskHandle = nullptr;
 TaskHandle_t motorTaskHandle = nullptr;
 TaskHandle_t piTaskHandle = nullptr;
 TaskHandle_t bleTxTaskHandle = nullptr;
+TaskHandle_t logTaskHandle = nullptr;
 TaskHandle_t sideTaskHandle = nullptr;
 
-// 여러 태스크가 같이 보는 값은 atomic으로 둔다.
 std::atomic<bool> bleConnected(false);
-std::atomic<int> sideLeftCm(-1);         // sideSensorTask가 쓰고 motorTask가 읽음
+std::atomic<uint32_t> advertiseRestartAt(0);   // 0 = 예약 없음
+
+// S보다 먼저 큐에 들어간 L/R/F는 번호가 정지 요청보다 작아서 버려진다.
+std::atomic<uint32_t> appCmdSeq(0);
+std::atomic<uint32_t> stopRequestSeq(0);
+std::atomic<bool> stopByDisconnect(false);
+std::atomic<int> sideLeftCm(-1);
 std::atomic<int> sideRightCm(-1);
+std::atomic<uint32_t> sideLeftAt(0);     // 마지막 측정 시각 (millis)
+std::atomic<uint32_t> sideRightAt(0);
+std::atomic<bool> bleAlertDropped(false);
+std::atomic<uint32_t> droppedLogs(0);
 std::atomic<uint32_t> obstacleMaxPeriodUs(0);
 
-// Flutter에서 받은 목표 방위각 (현재는 로그 확인용)
 float targetBearing = -1;
 
 
 // =====================================================
-// 로그
-//
-// 여러 태스크가 동시에 Serial.print를 여러 번 나눠 부르면
-// 줄이 섞이기 때문에, 한 줄을 만들어서 mutex 안에서 한 번에 찍는다.
+// 로그 / BLE 전송
 // =====================================================
 
-// printf 형식 검사: %d 자리에 문자열을 넣는 실수 등을 컴파일러가 잡아준다.
 void logLine(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 void sendBLEf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void sendReportf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+struct LogMsg {
+  char text[160];
+};
+
+// 로그는 큐에 넣기만 하고 출력은 logTask가 한다. 큐가 차면 로그만 버린다.
 void logLine(const char* fmt, ...) {
 
-  char buf[160];
+  LogMsg msg;
 
   va_list args;
   va_start(args, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, args);
+  vsnprintf(msg.text, sizeof(msg.text), fmt, args);
   va_end(args);
 
-  if (logMutex != nullptr) {
-    xSemaphoreTake(logMutex, portMAX_DELAY);
+  if (logQueue == nullptr) {
+    Serial.println(msg.text);
+    return;
   }
 
-  Serial.println(buf);
-
-  if (logMutex != nullptr) {
-    xSemaphoreGive(logMutex);
+  if (xQueueSend(logQueue, &msg, 0) != pdTRUE) {
+    droppedLogs++;
   }
 }
 
 
-// =====================================================
-// BLE Notify 요청
-//
-// 어느 태스크에서 불러도 된다. 실제 notify는 bleTxTask가 한다.
-// =====================================================
+bool fitsBle(const char* message) {
 
+  if (strlen(message) <= (size_t)BLE_MAX_PAYLOAD) {
+    return true;
+  }
+
+  logLine("[BLE TX] too long for MTU, dropped: %s", message);
+  return false;
+}
+
+
+// 중요한 알림. 큐가 차서 버려지면 큐가 빈 뒤 ST: 상태를 한 번 다시 보낸다.
 void sendBLE(const char* message) {
 
-  if (!bleConnected) {
+  if (!bleConnected || !fitsBle(message)) {
     return;
   }
 
@@ -334,9 +285,25 @@ void sendBLE(const char* message) {
   strncpy(msg.text, message, sizeof(msg.text) - 1);
   msg.text[sizeof(msg.text) - 1] = '\0';
 
-  if (xQueueSend(bleTxQueue, &msg, 0) != pdTRUE) {
-    logLine("[BLE TX] queue full, dropped: %s", message);
+  if (xQueueSend(bleAlertQueue, &msg, 0) != pdTRUE) {
+    bleAlertDropped = true;
+    logLine("[BLE TX] alert queue full, dropped: %s", message);
   }
+}
+
+// 주기 보고 / 기타 메시지. 밀리면 그냥 버린다.
+void sendReport(const char* message) {
+
+  if (!bleConnected || !fitsBle(message)) {
+    return;
+  }
+
+  BleMsg msg;
+
+  strncpy(msg.text, message, sizeof(msg.text) - 1);
+  msg.text[sizeof(msg.text) - 1] = '\0';
+
+  xQueueSend(bleReportQueue, &msg, 0);
 }
 
 void sendBLEf(const char* fmt, ...) {
@@ -351,81 +318,112 @@ void sendBLEf(const char* fmt, ...) {
   sendBLE(buf);
 }
 
+void sendReportf(const char* fmt, ...) {
 
-// =====================================================
-// motorTask로 이벤트 보내기
-//
-// 큐가 꽉 차 있으면 기다리지 않고 버린다. (보내는 쪽이 멈추지 않게)
-// 장애물 이벤트만 obstacleTask에서 따로 큐 맨 앞에 넣는다.
-// =====================================================
+  char buf[sizeof(BleMsg::text)];
 
-bool postEvent(EventType type, float value = 0) {
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
 
-  MotorEvent ev = { type, value, (uint32_t)micros() };
+  sendReport(buf);
+}
+
+
+bool postEvent(EventType type, float value = 0, uint32_t seq = 0, bool logFail = true) {
+
+  MotorEvent ev = { type, value, (uint32_t)micros(), seq, 0, 0 };
 
   if (xQueueSend(motorQueue, &ev, 0) != pdTRUE) {
-    logLine("[EVENT] queue full, dropped type=%d", (int)type);
+    if (logFail) {
+      logLine("[EVENT] queue full, type=%d", (int)type);
+    }
     return false;
   }
 
   return true;
 }
 
+bool postAppEvent(EventType type, float value = 0) {
+  return postEvent(type, value, ++appCmdSeq);
+}
+
+// S / BLE 연결 해제. 큐를 거치지 않아서 큐가 꽉 차도 사라지지 않는다.
+void requestStop(bool disconnected) {
+  stopByDisconnect = disconnected;
+  stopRequestSeq = ++appCmdSeq;
+}
+
 
 // #####################################################
-//
-// 여기부터 motorTask 전용
-//
-// 아래 변수와 함수는 motorTask 안에서만 쓴다.
-// 다른 태스크는 postEvent()로 "요청"만 보내기 때문에
-// mutex 없이도 상태가 꼬이지 않는다.
-//
+// 여기부터 motorTask 전용 (다른 태스크는 이벤트로만 요청)
 // #####################################################
 
-bool obstacleTriggered = false;
+enum ObstaclePhase : uint8_t {
+  OBS_NONE,
+  OBS_BRAKING,
+  OBS_SETTLING,
+  OBS_AVOIDING,
+  OBS_FINAL_BRAKE,
+  OBS_HOLD          // 막힘 / 앱 정지 / 연결 해제. 해제될 때까지 당기지 않음
+};
+
+ObstaclePhase obstaclePhase = OBS_NONE;
+uint32_t lastFrontSeq = 0;
+uint32_t appliedObstacleId = 0;
+unsigned long settleUntil = 0;
+
+// S / 연결 해제 뒤 새 앱 명령이 올 때까지 당기지 않는다. (역토크 경고는 함)
+bool motionLatched = false;
+uint32_t handledStopSeq = 0;
+
+// 첫 유효 측정 전까지도 이상으로 본다.
+bool frontSensorLost = true;
 
 bool crosswalkMode = false;
-bool trafficRed = false;
+bool trafficRed = false;        // 건너면 안 됨 (RED / GREEN_WAIT) -> 횡단 보정 금지
+bool redDeferred = false;       // 횡단 중 / 종료 유예 중 본 빨간불
+char lightState = 'N';          // 관측한 신호: N / R / G / W
+
+bool crossingActive = false;
+unsigned long crossingEndedAt = 0;
 
 AvoidState avoidState = AVOID_NONE;
 
 int avoidPulseCount = 0;
 unsigned long lastAvoidPulseAt = 0;
-unsigned long avoidPulseEndAt = 0;
-bool avoidPulseRunning = false;
 
-char crossSteer = 'C';               // 'L' / 'R' / 'C'
+char crossSteer = 'C';
 unsigned long lastCrossMsgAt = 0;
-unsigned long crossPulseEndAt = 0;
-bool crossPulseRunning = false;
 bool crossPulseStartNow = false;
 
 
-// =====================================================
-// 대기
-//
-// abortable = true : 기다리는 도중 obstacleTask가 xTaskNotifyGive()를 보내면
-//                    바로 깨어나서 false를 돌려준다. (장애물이 최우선)
-// abortable = false: 끝까지 기다린다.
-//                    (장애물 역토크 자체처럼 끊으면 안 되는 동작)
-//
-// 기존 delay()를 이걸로 바꾼 것이 핵심이다.
-// =====================================================
+// sideSensorTask가 멈춰 값이 오래됐으면 막힘(-1)으로 본다.
+int sideDistance(bool left) {
 
-bool waitMs(int ms, bool abortable) {
+  int distance = left ? sideLeftCm : sideRightCm;
+  uint32_t at = left ? sideLeftAt : sideRightAt;
 
-  if (!abortable) {
-    vTaskDelay(pdMS_TO_TICKS(ms));
-    return true;
+  if (distance < 0 || (uint32_t)millis() - at > (uint32_t)SIDE_STALE_MS) {
+    return -1;
   }
 
-  return ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ms)) == 0;
+  return distance;
 }
 
 
-// =====================================================
-// 모터 정지
-// =====================================================
+bool obstacleActive() {
+  return obstaclePhase != OBS_NONE;
+}
+
+const char* pullBlockedReason() {
+  if (frontSensorLost)  return "front sensor lost";
+  if (motionLatched)    return "stop latched";
+  if (obstacleActive()) return "obstacle";
+  return nullptr;
+}
+
 
 void stopMotors() {
   ledcWrite(M1_PWM, 0);
@@ -434,66 +432,201 @@ void stopMotors() {
 
 
 // =====================================================
-// PWM 램프업
-// 갑자기 목표 PWM을 넣지 않고 0 -> 목표값으로 단계적으로 증가
-// 중간에 끊기면 PWM을 0으로 두고 false
+// 모터 동작 상태 머신
+//
+//   [시작 지연] -> [램프업] -> [유지] -> [쉼] -> 다음 펄스 ...
+//
+// 한 번에 하나만 돈다. 새 동작을 시작하면 이전 동작은 취소된다.
 // =====================================================
 
-bool rampSingleMotor(int pwmPin, int targetPwm, bool abortable) {
+enum JobKind : uint8_t {
+  JOB_NONE,
+  JOB_GUIDE,
+  JOB_CROSS,
+  JOB_AVOID,
+  JOB_OBSTACLE_BRAKE,
+  JOB_RED_BRAKE
+};
 
-  const int stepDelay = MOTOR_RAMP_TIME_MS / MOTOR_RAMP_STEPS;
+enum JobPhase : uint8_t {
+  PH_DELAY,
+  PH_RAMP,
+  PH_HOLD,
+  PH_OFF
+};
 
-  for (int i = 1; i <= MOTOR_RAMP_STEPS; i++) {
+struct MotorJob {
+  JobKind kind = JOB_NONE;
+  JobPhase phase = PH_DELAY;
+  bool useM1 = false;
+  bool useM2 = false;
+  int pwm = 0;
+  int holdMs = 0;
+  int offMs = 0;
+  int pulses = 0;
+  int pulseIndex = 0;
+  int rampStep = 0;
+  char side = 'C';
+  unsigned long nextAt = 0;
+};
 
-    int pwm = (targetPwm * i) / MOTOR_RAMP_STEPS;
-    ledcWrite(pwmPin, pwm);
+MotorJob job;
 
-    if (!waitMs(stepDelay, abortable)) {
-      ledcWrite(pwmPin, 0);
-      return false;
-    }
+const char* jobName(JobKind kind) {
+  switch (kind) {
+    case JOB_GUIDE:          return "GUIDE";
+    case JOB_CROSS:          return "CROSS";
+    case JOB_AVOID:          return "AVOID";
+    case JOB_OBSTACLE_BRAKE: return "OBSTACLE_BRAKE";
+    case JOB_RED_BRAKE:      return "RED_BRAKE";
+    default:                 return "NONE";
   }
-
-  return true;
 }
 
-bool rampBothMotors(int targetPwm, bool abortable) {
+void writeJobPwm(int pwm) {
+  ledcWrite(M1_PWM, job.useM1 ? pwm : 0);
+  ledcWrite(M2_PWM, job.useM2 ? pwm : 0);
+}
 
-  const int stepDelay = MOTOR_RAMP_TIME_MS / MOTOR_RAMP_STEPS;
 
-  for (int i = 1; i <= MOTOR_RAMP_STEPS; i++) {
+// 모터부터 끄고 로그는 그 뒤에 (Serial 출력 시간만큼 정지가 늦어지지 않게)
+void cancelJob(const char* reason) {
 
-    int pwm = (targetPwm * i) / MOTOR_RAMP_STEPS;
-    ledcWrite(M1_PWM, pwm);
-    ledcWrite(M2_PWM, pwm);
+  JobKind previous = job.kind;
 
-    if (!waitMs(stepDelay, abortable)) {
-      stopMotors();
-      return false;
+  job.kind = JOB_NONE;
+
+  stopMotors();
+
+  digitalWrite(M1_DIR, LOW);
+  digitalWrite(M2_DIR, LOW);
+
+  if (previous != JOB_NONE) {
+    logLine("[JOB] %s cancelled - %s", jobName(previous), reason);
+  }
+}
+
+
+void startJob(JobKind kind, bool useM1, bool useM2, bool reverse,
+              int pwm, int holdMs, int offMs, int pulses,
+              int startDelayMs = 0, char side = 'C') {
+
+  cancelJob("replaced");
+
+  job.kind = kind;
+  job.useM1 = useM1;
+  job.useM2 = useM2;
+  job.pwm = pwm;
+  job.holdMs = holdMs;
+  job.offMs = offMs;
+  job.pulses = pulses;
+  job.pulseIndex = 0;
+  job.rampStep = 0;
+  job.side = side;
+  job.phase = PH_DELAY;
+  job.nextAt = millis() + startDelayMs;
+
+  digitalWrite(M1_DIR, (useM1 && reverse) ? HIGH : LOW);
+  digitalWrite(M2_DIR, (useM2 && reverse) ? HIGH : LOW);
+}
+
+
+void onJobDone(JobKind kind, char side);
+
+void stepJob() {
+
+  const int rampStepMs = MOTOR_RAMP_TIME_MS / MOTOR_RAMP_STEPS;
+
+  unsigned long now = millis();
+
+  while (job.kind != JOB_NONE && (long)(now - job.nextAt) >= 0) {
+
+    switch (job.phase) {
+
+      case PH_DELAY:
+      case PH_OFF:
+        if (job.kind == JOB_OBSTACLE_BRAKE || job.kind == JOB_RED_BRAKE) {
+          logLine("[BRAKE] %d/%d", job.pulseIndex + 1, job.pulses);
+        }
+        job.phase = PH_RAMP;
+        job.rampStep = 0;
+        job.nextAt = now;
+        break;
+
+      case PH_RAMP:
+        job.rampStep++;
+        writeJobPwm((job.pwm * job.rampStep) / MOTOR_RAMP_STEPS);
+
+        if (job.rampStep >= MOTOR_RAMP_STEPS) {
+          job.phase = PH_HOLD;
+          job.nextAt = now + rampStepMs + job.holdMs;
+        }
+        else {
+          job.nextAt = now + rampStepMs;
+        }
+        break;
+
+      case PH_HOLD:
+        writeJobPwm(0);
+        job.pulseIndex++;
+
+        if (job.pulseIndex < job.pulses) {
+          job.phase = PH_OFF;
+          job.nextAt = now + job.offMs;
+          break;
+        }
+
+        {
+          JobKind done = job.kind;
+          char side = job.side;
+
+          job.kind = JOB_NONE;
+          stopMotors();
+          digitalWrite(M1_DIR, LOW);
+          digitalWrite(M2_DIR, LOW);
+
+          onJobDone(done, side);
+        }
+        break;
     }
   }
+}
 
-  return true;
+
+TickType_t jobWaitTicks() {
+
+  if (job.kind == JOB_NONE) {
+    return pdMS_TO_TICKS(MOTOR_TICK_MS);
+  }
+
+  long remain = (long)(job.nextAt - millis());
+
+  if (remain <= 0) {
+    return 0;
+  }
+
+  if (remain > MOTOR_TICK_MS) {
+    remain = MOTOR_TICK_MS;
+  }
+
+  return pdMS_TO_TICKS(remain);
 }
 
 
 // =====================================================
-// LEFT / RIGHT 유도
-//
-// 사용자가 앞으로 끌고 있기 때문에
-// LEFT : 오른쪽 바퀴 M2에 짧게 힘을 줘서 왼쪽 방향 유도
-// RIGHT: 왼쪽 바퀴 M1에 짧게 힘을 줘서 오른쪽 방향 유도
-//
-// 기존처럼 끝날 때까지(약 350ms) 기다리지만,
-// 그 사이 장애물이 확정되면 바로 끊긴다.
+// 앱 길안내
+// LEFT: M2(오른쪽 바퀴) / RIGHT: M1(왼쪽 바퀴)
+// F는 모터를 돌리지 않고 길안내 당김만 끊는다.
 // =====================================================
 
 void guidePulse(char side, float angle) {
 
   const char* name = (side == 'L') ? "LEFT" : "RIGHT";
 
-  if (obstacleTriggered) {
-    logLine("[MOTOR] %s ignored - obstacle", name);
+  const char* blocked = pullBlockedReason();
+
+  if (blocked != nullptr) {
+    logLine("[MOTOR] %s ignored - %s", name, blocked);
     return;
   }
 
@@ -502,141 +635,107 @@ void guidePulse(char side, float angle) {
     return;
   }
 
-  logLine("[MOTOR] %s | angle=%.2f", name, angle);
-
-  int pwmPin  = (side == 'L') ? M2_PWM : M1_PWM;
-  int dirPin  = (side == 'L') ? M2_DIR : M1_DIR;
-  int idlePin = (side == 'L') ? M1_PWM : M2_PWM;
-
-  ledcWrite(idlePin, 0);
-  digitalWrite(dirPin, LOW);
-
-  bool done = rampSingleMotor(pwmPin, GUIDE_PWM, true) &&
-              waitMs(GUIDE_TIME, true);
-
-  ledcWrite(pwmPin, 0);
-
-  if (!done) {
-    logLine("[MOTOR] %s aborted - obstacle", name);
+  if (job.kind != JOB_NONE && job.kind != JOB_GUIDE) {
+    logLine("[MOTOR] %s ignored - %s running", name, jobName(job.kind));
     return;
   }
 
-  sendBLE(side == 'L' ? "MOTOR:L" : "MOTOR:R");
+  logLine("[MOTOR] %s | angle=%.2f", name, angle);
+
+  bool left = side == 'L';
+
+  startJob(JOB_GUIDE, !left, left, false, GUIDE_PWM, GUIDE_TIME, 0, 1, 0, side);
 }
 
-void guideLeft(float angle) {
-  guidePulse('L', angle);
-}
-
-void guideRight(float angle) {
-  guidePulse('R', angle);
-}
-
-
-// =====================================================
-// 직진
-//
-// 현재 장치는 사용자가 직접 앞으로 끌기 때문에
-// F 명령에서는 모터를 돌리지 않음.
-// =====================================================
 
 void guideForward() {
 
-  if (obstacleTriggered) {
-    return;
+  if (job.kind == JOB_GUIDE) {
+    cancelJob("forward");
   }
-
-  stopMotors();
 
   logLine("[MOTOR] FORWARD / NEUTRAL");
 }
 
 
 // =====================================================
-// 역토크 count회 (장애물 경고 / 빨간불 정지 알림 공용)
-//
-// 장애물 경고는 abortable=false (끝까지)
-// 빨간불 알림은 abortable=true  (도중에 장애물이 오면 그쪽 우선)
+// 정지 (앱 S / BLE 연결 해제)
 // =====================================================
 
-bool reverseTorquePulses(int count, bool abortable) {
+void holdStop(const char* reason) {
 
-  // 진행 방향 반대
-  digitalWrite(M1_DIR, HIGH);
-  digitalWrite(M2_DIR, HIGH);
+  cancelJob(reason);
 
-  bool done = true;
+  motionLatched = true;
 
-  for (int i = 0; i < count; i++) {
-
-    logLine("[BRAKE] %d/%d", i + 1, count);
-
-    // 역토크 ON: 두 모터를 동시에 0 -> BRAKE_PWM으로 램프업
-    if (!rampBothMotors(BRAKE_PWM, abortable) ||
-        !waitMs(BRAKE_ON_TIME, abortable)) {
-      done = false;
-      break;
-    }
-
-    // OFF
-    stopMotors();
-
-    if (!waitMs(BRAKE_OFF_TIME, abortable)) {
-      done = false;
-      break;
-    }
+  if (obstacleActive()) {
+    obstaclePhase = OBS_HOLD;
   }
 
-  stopMotors();
+  avoidState = AVOID_NONE;
 
-  // 일반 방향으로 복귀
-  digitalWrite(M1_DIR, LOW);
-  digitalWrite(M2_DIR, LOW);
+  crossSteer = 'C';
+  crossPulseStartNow = false;
 
-  logLine(done ? "*** BRAKE END ***" : "*** BRAKE ABORTED - obstacle ***");
-
-  return done;
+  logLine("[MOTOR] STOP (%s) -> hold until next app command", reason);
 }
 
 
-// 장애물 역토크 3회
-void obstacleWarning() {
+void checkStopRequest() {
 
-  logLine("");
-  logLine("*** OBSTACLE WARNING ***");
+  uint32_t req = stopRequestSeq;
 
-  reverseTorquePulses(BRAKE_COUNT, false);
+  if (req == handledStopSeq) {
+    return;
+  }
+
+  handledStopSeq = req;
+
+  bool disconnected = stopByDisconnect;
+
+  holdStop(disconnected ? "BLE disconnected" : "app S");
+
+  if (!disconnected) {
+    sendBLE("MOTOR:STOP");
+  }
+}
+
+
+bool acceptAppCommand(const MotorEvent& ev) {
+
+  if ((int32_t)(ev.seq - handledStopSeq) <= 0) {
+    logLine("[MOTOR] app command before stop dropped (seq=%lu)", (unsigned long)ev.seq);
+    return false;
+  }
+
+  if (motionLatched) {
+    motionLatched = false;
+    logLine("[MOTOR] stop latch released by new app command");
+  }
+
+  return true;
 }
 
 
 // =====================================================
-// 횡단보도 보정 상태 변경
-// Raspberry Pi -> CROSS_MOTOR:L / R / CENTER
-//
-// 여기서는 상태만 바꾸고, 실제 당김은 updateCrosswalkSteering()이
-// 한 번 실행한다. 앱에는 방향이 바뀔 때만 알린다.
+// 횡단 보정 (Pi CROSS_MOTOR:L / R / CENTER)
+// L/R을 받으면 한 번만 당기고, CENTER가 오면 바로 멈춘다.
 // =====================================================
 
 void setCrossSteer(char dir) {
 
   lastCrossMsgAt = millis();
 
-  // 같은 방향이 반복으로 와도 다시 당기지 않는다.
-  // (Pi는 펄스마다 CENTER를 사이에 끼워서 보낸다)
   if (dir == crossSteer) {
     return;
   }
 
   crossSteer = dir;
 
-  // 당기던 중이면 끊는다. (CENTER가 오면 여기서 바로 멈춤)
-  if (crossPulseRunning && !obstacleTriggered) {
-    stopMotors();
+  if (job.kind == JOB_CROSS) {
+    cancelJob("cross direction changed");
   }
 
-  crossPulseRunning = false;
-
-  // L/R일 때만 한 번 당기기 예약
   crossPulseStartNow = (dir == 'L' || dir == 'R');
 
   logLine("[CROSS MOTOR] %c", dir);
@@ -653,43 +752,31 @@ void setCrossSteer(char dir) {
 }
 
 
-// 횡단 보정 멈춤 (장애물 회피 중이면 그 모터 동작은 건드리지 않음)
 void stopCrossSteer() {
 
   crossSteer = 'C';
-
-  if (!obstacleTriggered) {
-    stopMotors();
-  }
-
-  crossPulseRunning = false;
   crossPulseStartNow = false;
+
+  if (job.kind == JOB_CROSS) {
+    cancelJob("cross steer stop");
+  }
 }
 
 
-// =====================================================
-// 횡단 보정 펄스 처리 (motorTask에서 매번 호출)
-//
-// L/R을 받으면 한 번만 당기고, 스스로 반복하지 않는다.
-// =====================================================
+// 횡단보도 앞 / 신호 대기 / 횡단 시작: 길안내와 횡단 보정 당김을 모두 끊는다.
+void stopPullsForCrosswalk(const char* reason) {
+
+  stopCrossSteer();
+
+  if (job.kind == JOB_GUIDE) {
+    cancelJob(reason);
+  }
+}
+
 
 void updateCrosswalkSteering() {
 
-  unsigned long now = millis();
-
-  // 안전 상한: CENTER를 못 받아도 최대 시간이 지나면 끄기
-  if (crossPulseRunning && (long)(now - crossPulseEndAt) >= 0) {
-
-    if (!obstacleTriggered) {
-      stopMotors();
-    }
-
-    crossPulseRunning = false;
-  }
-
-  // 장애물 회피가 최우선. 대기 중이던 당김도 버린다.
-  if (obstacleTriggered) {
-    crossPulseRunning = false;
+  if (pullBlockedReason() != nullptr) {
     crossPulseStartNow = false;
     return;
   }
@@ -699,8 +786,7 @@ void updateCrosswalkSteering() {
     return;
   }
 
-  // Pi 메시지가 끊기면 멈춤 (Pi 멈춤 / 케이블 빠짐 대비)
-  if (now - lastCrossMsgAt > (unsigned long)CROSS_TIMEOUT_MS) {
+  if (millis() - lastCrossMsgAt > (unsigned long)CROSS_TIMEOUT_MS) {
 
     logLine("[CROSS MOTOR] Pi timeout -> CENTER");
 
@@ -709,97 +795,24 @@ void updateCrosswalkSteering() {
     return;
   }
 
-  if (crossPulseRunning || !crossPulseStartNow) {
+  if (!crossPulseStartNow || job.kind != JOB_NONE) {
     return;
   }
 
   crossPulseStartNow = false;
 
-  bool ramped;
+  bool left = crossSteer == 'L';
 
-  if (crossSteer == 'L') {
-    // 오른쪽 바퀴 M2로 왼쪽 유도
-    ledcWrite(M1_PWM, 0);
-    digitalWrite(M2_DIR, LOW);
-    ramped = rampSingleMotor(M2_PWM, CROSS_PWM, true);
-  }
-  else {
-    // 왼쪽 바퀴 M1로 오른쪽 유도
-    ledcWrite(M2_PWM, 0);
-    digitalWrite(M1_DIR, LOW);
-    ramped = rampSingleMotor(M1_PWM, CROSS_PWM, true);
-  }
-
-  // 램프업 도중 장애물 확정 -> 큐 맨 앞의 장애물 이벤트가 이어서 처리됨
-  if (!ramped) {
-    stopMotors();
-    return;
-  }
-
-  crossPulseRunning = true;
-
-  // 램프업이 끝난 시점부터 최대 유지시간 계산
-  crossPulseEndAt = millis() + CROSS_PULSE_MAX_TIME;
-
-  // 기존에는 여기서 readRaspberryPi()를 한 번 더 불렀지만,
-  // 램프업 동안 온 CENTER는 큐에 들어 있으므로 바로 다음에 처리된다.
+  startJob(JOB_CROSS, !left, left, false, CROSS_PWM, CROSS_PULSE_MAX_TIME, 0, 1);
 }
 
 
 // =====================================================
-// 장애물 회피용 당김 (non-blocking)
+// 장애물 회피
 //
-// 끝나는 시각만 기록하고 돌아가서,
-// 당기는 동안에도 다른 이벤트(장애물 해제 등)를 처리한다.
-//
-// LEFT : 오른쪽 바퀴 M2 구동
-// RIGHT: 왼쪽 바퀴 M1 구동
-// =====================================================
-
-void startAvoidPulse(AvoidState side) {
-
-  bool left = side == AVOID_LEFT;
-
-  logLine("[AVOID] PULL %s #%d", left ? "LEFT" : "RIGHT", avoidPulseCount + 1);
-
-  if (left) {
-    ledcWrite(M1_PWM, 0);
-    digitalWrite(M2_DIR, LOW);
-    rampSingleMotor(M2_PWM, AVOID_PWM, false);
-  }
-  else {
-    ledcWrite(M2_PWM, 0);
-    digitalWrite(M1_DIR, LOW);
-    rampSingleMotor(M1_PWM, AVOID_PWM, false);
-  }
-
-  avoidPulseRunning = true;
-  lastAvoidPulseAt = millis();
-  avoidPulseEndAt = lastAvoidPulseAt + AVOID_PULSE_TIME;
-  avoidPulseCount++;
-
-  sendBLE(left ? "MOTOR:L" : "MOTOR:R");
-}
-
-
-// 당기는 시간이 끝났으면 모터를 끈다.
-void updateAvoidPulse() {
-
-  if (avoidPulseRunning && (long)(millis() - avoidPulseEndAt) >= 0) {
-    stopMotors();
-    avoidPulseRunning = false;
-  }
-}
-
-
-// =====================================================
-// 회피 방향 고르기
-//
-// - 30cm 미만(또는 읽기 실패)인 쪽은 막힌 것으로 본다.
-// - 양쪽 다 막힘 -> BLOCKED
-// - 이미 피하던 쪽이 아직 열려 있으면 유지 (좌우 왔다갔다 방지)
-// - 한쪽만 열림 -> 그쪽
-// - 둘 다 열림 -> 20cm 넘게 더 넓은 쪽, 비슷하면 오른쪽(우측 보행)
+// - 30cm 미만 / 측정 무효(-1)인 쪽은 막힘
+// - 이미 피하던 쪽이 아직 열려 있으면 유지
+// - 둘 다 열림 -> 20cm 넘게 넓은 쪽, 비슷하면 오른쪽
 // =====================================================
 
 AvoidState chooseAvoidSide(int leftDistance, int rightDistance) {
@@ -835,7 +848,6 @@ AvoidState chooseAvoidSide(int leftDistance, int rightDistance) {
 }
 
 
-// 회피 상태가 바뀔 때만 앱에 알린다. (앱이 음성으로 안내)
 void setAvoidState(AvoidState next) {
 
   if (next == avoidState) {
@@ -851,98 +863,96 @@ void setAvoidState(AvoidState next) {
     sendBLE("AVOID:R");
   }
   else if (next == AVOID_BLOCKED) {
-    stopMotors();
-    avoidPulseRunning = false;
     sendBLE("AVOID:BLOCKED");
   }
 }
 
 
-// =====================================================
-// 장애물 확정 (EV_OBSTACLE_CONFIRMED)
-//
-// 1) 역토크 3회로 멈춤 알림
-// 2) 좌/우 VL53L1X로 회피 방향 결정 (chooseAvoidSide)
-// 3) 그 방향으로 첫 당김 시작
-//    -> 이후 updateObstacleAvoidance()가 정면이 트일 때까지 반복
-// =====================================================
+void startAvoidPulse(AvoidState side) {
 
-void handleObstacleConfirmed(const MotorEvent& ev) {
+  bool left = side == AVOID_LEFT;
 
-  // 대기 중이 아닐 때 받은 중단 신호가 남아 있으면 정리한다.
-  // (안 그러면 다음 abortable 대기가 괜히 바로 끝난다)
-  ulTaskNotifyTake(pdTRUE, 0);
+  logLine("[AVOID] PULL %s #%d", left ? "LEFT" : "RIGHT", avoidPulseCount + 1);
 
-  stopMotors();
+  startJob(JOB_AVOID, !left, left, false, AVOID_PWM, AVOID_PULSE_TIME, 0, 1, 0,
+           left ? 'L' : 'R');
 
-  logLine("[LATENCY] obstacle confirm -> motor stop: %lu us",
-       (unsigned long)(micros() - ev.stampUs));
+  lastAvoidPulseAt = millis();
+  avoidPulseCount++;
 
-  obstacleTriggered = true;
-
-  // 대기 중이던 횡단 보정도 버린다.
-  crossPulseRunning = false;
-  crossPulseStartNow = false;
-
-  logLine("");
-  logLine("[AVOID] FRONT OBSTACLE CONFIRMED -> BRAKE FIRST");
-
-  // Flutter 앱에 장애물 음성 안내 요청.
-  // 장애물 1건당 역토크 시작 직전에 딱 한 번만 전송한다.
-  sendBLE("OBSTACLE_BRAKE");
-
-  // BLE Notify가 앱으로 전달될 시간을 아주 짧게 확보.
-  vTaskDelay(pdMS_TO_TICKS(50));
-
-  // 역토크 3회
-  obstacleWarning();
-
-  // 역토크 직후 잠깐 안정화
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  // 기존의 flushTFmini()는 필요 없다.
-  // obstacleTask가 역토크 동안에도 10ms마다 계속 읽고 있다.
-
-  // 좌우 거리: sideSensorTask가 계속 갱신하는 최신 값
-  int leftDistance = sideLeftCm;
-  int rightDistance = sideRightCm;
-
-  logLine("");
-  logLine("========== OBSTACLE AVOID ==========");
-  logLine("FRONT = %d cm", (int)ev.value);
-  logLine("LEFT  = %d cm", leftDistance);
-  logLine("RIGHT = %d cm", rightDistance);
-
-  avoidPulseCount = 0;
-  avoidPulseRunning = false;
-  avoidState = AVOID_NONE;
-
-  AvoidState side = chooseAvoidSide(leftDistance, rightDistance);
-
-  setAvoidState(side);
-
-  if (side == AVOID_BLOCKED) {
-    // 양쪽 다 막힘 (또는 센서 읽기 실패). 역토크는 이미 실행됨.
-    logLine("[AVOID] BOTH SIDES BLOCKED -> STOP");
-    return;
-  }
-
-  startAvoidPulse(side);
+  sendBLE(left ? "MOTOR:L" : "MOTOR:R");
 }
 
 
-// =====================================================
-// 장애물 해제 (EV_OBSTACLE_CLEAR)
-// 정면이 50cm 이상으로 다시 멀어짐
-// =====================================================
+void startObstacleBrake(int startDelayMs) {
+
+  logLine("*** OBSTACLE WARNING ***");
+
+  startJob(JOB_OBSTACLE_BRAKE, true, true, true,
+           BRAKE_PWM, BRAKE_ON_TIME, BRAKE_OFF_TIME, BRAKE_COUNT, startDelayMs);
+}
+
+
+// 끝까지 끝난 동작만 불린다. (취소된 경우 X)
+void onJobDone(JobKind kind, char side) {
+
+  switch (kind) {
+
+    case JOB_GUIDE:
+      sendBLE(side == 'L' ? "MOTOR:L" : "MOTOR:R");
+      break;
+
+    case JOB_OBSTACLE_BRAKE:
+      logLine("*** BRAKE END ***");
+
+      if (obstaclePhase == OBS_BRAKING) {
+        obstaclePhase = OBS_SETTLING;
+        settleUntil = millis() + OBSTACLE_SETTLE_MS;
+      }
+      else if (obstaclePhase == OBS_FINAL_BRAKE) {
+        obstaclePhase = OBS_HOLD;
+      }
+      break;
+
+    case JOB_RED_BRAKE:
+      logLine("*** RED BRAKE END ***");
+      break;
+
+    default:
+      break;
+  }
+}
+
+
+void handleObstacleConfirmed(const MotorEvent& ev) {
+
+  cancelJob("obstacle");
+
+  logLine("[LATENCY] obstacle confirm -> motor stop: %lu us",
+          (unsigned long)(micros() - ev.stampUs));
+
+  crossPulseStartNow = false;
+
+  avoidPulseCount = 0;
+  avoidState = AVOID_NONE;
+
+  logLine("[AVOID] FRONT OBSTACLE CONFIRMED (%d cm) -> BRAKE FIRST", (int)ev.value);
+
+  sendBLE("OBSTACLE_BRAKE");
+
+  obstaclePhase = OBS_BRAKING;
+
+  startObstacleBrake(OBSTACLE_NOTIFY_DELAY_MS);
+}
+
 
 void handleObstacleClear() {
 
-  obstacleTriggered = false;
+  if (job.kind == JOB_OBSTACLE_BRAKE || job.kind == JOB_AVOID) {
+    cancelJob("obstacle cleared");
+  }
 
-  // 회피 유도 종료
-  stopMotors();
-  avoidPulseRunning = false;
+  obstaclePhase = OBS_NONE;
   avoidPulseCount = 0;
   avoidState = AVOID_NONE;
 
@@ -952,27 +962,91 @@ void handleObstacleClear() {
 }
 
 
+// 정면 센서 이상: 모든 당김 금지. 빨간불 역토크 경고는 계속.
+// (OBSTACLE_CLEAR를 보내면 앱이 "장애물을 지났습니다"라고 하므로 보내지 않는다)
+void handleFrontSensorLost() {
+
+  frontSensorLost = true;
+
+  if (job.kind != JOB_NONE && job.kind != JOB_RED_BRAKE) {
+    cancelJob("front sensor lost");
+  }
+
+  crossPulseStartNow = false;
+
+  obstaclePhase = OBS_NONE;
+  avoidPulseCount = 0;
+  avoidState = AVOID_NONE;
+
+  logLine("[TFmini] sensor lost -> all pulls blocked");
+}
+
+
+void handleFrontSensorOk() {
+
+  frontSensorLost = false;
+
+  logLine("[TFmini] sensor OK -> pulls allowed again");
+}
+
+
 // =====================================================
-// 장애물 회피 중 반복 (obstacleTriggered일 때 매번 호출)
+// 정면 상태 (EV_FRONT_STATE)
 //
-// 정면이 아직 막혀 있으면 AVOID_REPEAT_MS마다 다시 당긴다.
-// AVOID_MAX_PULSES번 당겨도 정면이 안 트이면 "길 막힘"으로
-// 역토크를 한 번 더 주고 멈춘다.
+// obstacleTask는 센서 이상 / 장애물 여부를 한 묶음으로 보낸다.
+// 번호(seq)가 가장 큰 묶음이 최신 상태이므로 오래된 묶음은 버려도
+// 정보가 사라지지 않는다.
 // =====================================================
 
-void updateObstacleAvoidance() {
+void handleFrontState(const MotorEvent& ev) {
 
-  updateAvoidPulse();
-
-  if (avoidState != AVOID_LEFT && avoidState != AVOID_RIGHT) {
+  if ((int32_t)(ev.seq - lastFrontSeq) <= 0) {
+    logLine("[FRONT] stale state dropped (seq=%lu last=%lu)",
+            (unsigned long)ev.seq, (unsigned long)lastFrontSeq);
     return;
   }
 
-  if (avoidPulseRunning) {
+  lastFrontSeq = ev.seq;
+
+  if (ev.flags & FRONT_LOST) {
+    if (!frontSensorLost) {
+      handleFrontSensorLost();
+    }
     return;
   }
 
-  if (millis() - lastAvoidPulseAt < (unsigned long)AVOID_REPEAT_MS) {
+  if (frontSensorLost) {
+    handleFrontSensorOk();
+  }
+
+  if (ev.flags & FRONT_OBSTACLE) {
+    if (ev.obstacleId != appliedObstacleId) {
+      appliedObstacleId = ev.obstacleId;
+      handleObstacleConfirmed(ev);
+    }
+  }
+  else if (obstacleActive()) {
+    handleObstacleClear();
+  }
+}
+
+
+// 회피 다음 단계 고르기: 막혔으면 멈추고, 아니면 그쪽으로 당긴다.
+void pullTowardOpenSide() {
+
+  AvoidState side = chooseAvoidSide(sideDistance(true), sideDistance(false));
+
+  setAvoidState(side);
+
+  if (side == AVOID_BLOCKED) {
+    logLine("[AVOID] BOTH SIDES BLOCKED -> STOP");
+    obstaclePhase = OBS_HOLD;
+    return;
+  }
+
+  if (motionLatched) {
+    logLine("[AVOID] stop latched -> no pull");
+    obstaclePhase = OBS_HOLD;
     return;
   }
 
@@ -982,102 +1056,273 @@ void updateObstacleAvoidance() {
 
     setAvoidState(AVOID_BLOCKED);
 
-    obstacleWarning();
-
+    obstaclePhase = OBS_FINAL_BRAKE;
+    startObstacleBrake(0);
     return;
   }
 
-  AvoidState side = chooseAvoidSide(sideLeftCm, sideRightCm);
+  obstaclePhase = OBS_AVOIDING;
+  startAvoidPulse(side);
+}
 
-  setAvoidState(side);
 
-  if (side == AVOID_LEFT || side == AVOID_RIGHT) {
-    startAvoidPulse(side);
+void updateObstacleAvoidance() {
+
+  unsigned long now = millis();
+
+  if (obstaclePhase == OBS_SETTLING) {
+
+    if ((long)(now - settleUntil) < 0) {
+      return;
+    }
+
+    logLine("[AVOID] LEFT=%d cm RIGHT=%d cm", sideDistance(true), sideDistance(false));
+
+    pullTowardOpenSide();
+    return;
   }
+
+  if (obstaclePhase != OBS_AVOIDING) {
+    return;
+  }
+
+  // 당기는 중에 그쪽이 막히거나 측정이 무효가 되면 바로 멈춘다.
+  // 반대쪽 당김은 다음 간격(AVOID_REPEAT_MS)에 시작한다.
+  if (job.kind == JOB_AVOID) {
+
+    int distance = sideDistance(avoidState == AVOID_LEFT);
+
+    if (distance >= SIDE_BLOCK_DISTANCE) {
+      return;
+    }
+
+    cancelJob("avoid side blocked");
+    logLine("[AVOID] %s side now %d cm -> stop",
+            avoidState == AVOID_LEFT ? "LEFT" : "RIGHT", distance);
+
+    AvoidState side = chooseAvoidSide(sideDistance(true), sideDistance(false));
+
+    setAvoidState(side);
+
+    if (side == AVOID_BLOCKED) {
+      logLine("[AVOID] BOTH SIDES BLOCKED -> STOP");
+      obstaclePhase = OBS_HOLD;
+    }
+    return;
+  }
+
+  if (now - lastAvoidPulseAt < (unsigned long)AVOID_REPEAT_MS) {
+    return;
+  }
+
+  pullTowardOpenSide();
 }
 
 
 // =====================================================
-// Raspberry Pi 이벤트 처리 (기존 handlePiMessage의 상태 변경 부분)
+// 신호 / 횡단
 // =====================================================
 
-void handlePiEvent(EventType type) {
+bool isCrossingNow() {
+
+  if (crossingActive) {
+    return true;
+  }
+
+  return crossingEndedAt != 0 &&
+         millis() - crossingEndedAt < (unsigned long)CROSSING_RED_GRACE_MS;
+}
+
+
+// ageMs: CROSSING_END를 받은 뒤 처리되기까지 걸린 시간 (유예를 받은 시각부터 센다)
+void endCrossing(uint32_t ageMs = 0) {
+
+  if (crossingActive) {
+    crossingEndedAt = millis() - ageMs;
+    if (crossingEndedAt == 0) {
+      crossingEndedAt = 1;
+    }
+  }
+
+  crossingActive = false;
+}
+
+
+// 앱 LIGHT:RED + (기다리던 중이 아니었으면) 역토크 2회
+void applyRed() {
+
+  if (crosswalkMode && trafficRed && lightState == 'R') {
+    return;
+  }
+
+  bool brake = !trafficRed;
+
+  crosswalkMode = true;
+  trafficRed = true;
+  lightState = 'R';
+
+  stopPullsForCrosswalk("red");
+
+  sendBLE("LIGHT:RED");
+
+  if (brake && !obstacleActive()) {
+
+    logLine("[TRAFFIC] RED -> stop warning");
+
+    startJob(JOB_RED_BRAKE, true, true, true,
+             BRAKE_PWM, BRAKE_ON_TIME, BRAKE_OFF_TIME, RED_BRAKE_COUNT);
+  }
+}
+
+
+void updateDeferredRed() {
+
+  if (!redDeferred || isCrossingNow()) {
+    return;
+  }
+
+  redDeferred = false;
+
+  logLine("[TRAFFIC] crossing over, red still pending -> RED");
+
+  applyRed();
+}
+
+
+void cancelRedBrake(const char* reason) {
+  if (job.kind == JOB_RED_BRAKE) {
+    cancelJob(reason);
+  }
+}
+
+
+// 같은 메시지가 반복으로 와도 결과가 같다. 상태가 바뀔 때만 앱에 알린다.
+void handlePiEvent(EventType type, uint32_t ageMs) {
 
   switch (type) {
 
-    // 횡단보도 감지
     case EV_PI_CROSSWALK_ON:
+
+      if (crosswalkMode) {
+        break;
+      }
+
       crosswalkMode = true;
-      stopCrossSteer();
+      stopPullsForCrosswalk("crosswalk");
       sendBLE("CROSSWALK:1");
       break;
 
-    // 횡단보도 사라짐
     case EV_PI_CROSSWALK_OFF:
+
+      redDeferred = false;
+
+      if (!crosswalkMode && !crossingActive) {
+        break;
+      }
+
       crosswalkMode = false;
       trafficRed = false;
+      lightState = 'N';
+      endCrossing();
+      cancelRedBrake("crosswalk off");
       stopCrossSteer();
       sendBLE("CROSSWALK:0");
       break;
 
-    // 빨간불
-    case EV_PI_LIGHT_RED: {
+    // 건너는 중이면 역토크 없이 끝까지 건너게 하고, 본 빨간불은 저장해 둔다.
+    case EV_PI_LIGHT_RED:
 
-      // 빨간불로 "바뀐" 순간에만 역토크 (같은 메시지 반복 시 다시 안 줌)
-      bool turnedRed = !trafficRed;
+      if (isCrossingNow()) {
+
+        if (!redDeferred) {
+          logLine("[TRAFFIC] RED while crossing -> no brake, deferred");
+        }
+
+        redDeferred = true;
+
+        if (crossingActive) {
+          lightState = 'R';
+        }
+
+        sendBLE("CROSSING_RED");
+        break;
+      }
+
+      applyRed();
+      break;
+
+    case EV_PI_LIGHT_GREEN: {
+
+      bool changed = !crosswalkMode || lightState != 'G';
 
       crosswalkMode = true;
-      trafficRed = true;
+      trafficRed = false;
+      lightState = 'G';
+      redDeferred = false;
 
-      stopCrossSteer();
+      cancelRedBrake("green");
 
-      sendBLE("LIGHT:RED");
-
-      // 장애물 회피 중에는 그쪽 동작을 우선
-      if (turnedRed && !obstacleTriggered) {
-
-        logLine("[TRAFFIC] RED -> stop warning");
-
-        // 기존과 달리, 역토크 도중 장애물이 확정되면 바로 끊고 장애물 처리로 넘어간다.
-        reverseTorquePulses(RED_BRAKE_COUNT, true);
+      if (!changed) {
+        break;
       }
+
+      if (!crossingActive) {
+        stopPullsForCrosswalk("green");
+      }
+
+      sendBLE("LIGHT:GREEN");
       break;
     }
 
-    // 초록불
-    case EV_PI_LIGHT_GREEN:
-      crosswalkMode = true;
-      trafficRed = false;
-      stopCrossSteer();
-      sendBLE("LIGHT:GREEN");
-      break;
-
-    // 초록불이 이미 켜져 있음 (빨간불을 못 봄)
-    // 남은 시간을 모르므로 건너지 않고 다음 신호를 기다린다.
+    // 초록불이 이미 켜져 있음: 남은 시간을 모르므로 다음 신호를 기다린다.
     case EV_PI_LIGHT_GREEN_WAIT:
+
+      if (isCrossingNow()) {
+        logLine("[TRAFFIC] GREEN_WAIT during crossing -> ignored");
+        break;
+      }
+
+      if (crosswalkMode && lightState == 'W') {
+        break;
+      }
+
       crosswalkMode = true;
       trafficRed = true;
-      stopCrossSteer();
+      lightState = 'W';
+      cancelRedBrake("green wait");
+      stopPullsForCrosswalk("green wait");
       sendBLE("LIGHT:GREEN_WAIT");
       break;
 
-    // 횡단 시작
     case EV_PI_CROSSING_START:
+
+      if (crossingActive) {
+        break;
+      }
+
       crosswalkMode = true;
       trafficRed = false;
-      stopCrossSteer();
+      lightState = redDeferred ? 'R' : 'G';
+      crossingActive = true;
+      cancelRedBrake("crossing start");
+      stopPullsForCrosswalk("crossing start");
       sendBLE("CROSSING_START");
       break;
 
-    // 횡단 종료
     case EV_PI_CROSSING_END:
+
+      if (!crossingActive && !crosswalkMode) {
+        break;
+      }
+
       crosswalkMode = false;
       trafficRed = false;
+      lightState = 'N';
+      endCrossing(ageMs);
       stopCrossSteer();
       sendBLE("CROSSING_END");
       break;
 
-    // 횡단 중 방향 보정
     case EV_PI_CROSS_L:
       setCrossSteer('L');
       break;
@@ -1096,56 +1341,88 @@ void handlePiEvent(EventType type) {
 }
 
 
+// =====================================================
+// 상태 응답 (앱 Q -> ST:abcdefg)
+//
+//  a 장애물 처리 중   0 / 1
+//  b 회피 방향        N / L / R / B
+//  c 횡단보도 모드    0 / 1
+//  d 신호             N / R / G / W
+//  e 횡단 중          0 / 1
+//  f 정면 센서        1 정상 / 0 이상
+//  g 정지 유지        0 / 1
+// =====================================================
+
+void sendCaneState() {
+
+  char avoid = 'N';
+
+  if (obstacleActive()) {
+    avoid = avoidState == AVOID_LEFT    ? 'L'
+          : avoidState == AVOID_RIGHT   ? 'R'
+          : avoidState == AVOID_BLOCKED ? 'B'
+          : 'N';
+  }
+
+  char light = redDeferred ? 'R' : crosswalkMode ? lightState : 'N';
+
+  sendBLEf("ST:%c%c%c%c%c%c%c",
+           obstacleActive() ? '1' : '0',
+           avoid,
+           crosswalkMode ? '1' : '0',
+           light,
+           crossingActive ? '1' : '0',
+           frontSensorLost ? '0' : '1',
+           motionLatched ? '1' : '0');
+}
+
+
 void handleMotorEvent(const MotorEvent& ev) {
 
   switch (ev.type) {
 
-    case EV_OBSTACLE_CONFIRMED:
-      handleObstacleConfirmed(ev);
-      break;
-
-    case EV_OBSTACLE_CLEAR:
-      handleObstacleClear();
+    case EV_FRONT_STATE:
+      handleFrontState(ev);
       break;
 
     case EV_APP_LEFT:
-      guideLeft(ev.value);
+      if (acceptAppCommand(ev)) {
+        guidePulse('L', ev.value);
+      }
       break;
 
     case EV_APP_RIGHT:
-      guideRight(ev.value);
+      if (acceptAppCommand(ev)) {
+        guidePulse('R', ev.value);
+      }
       break;
 
     case EV_APP_FORWARD:
-      guideForward();
+      if (acceptAppCommand(ev)) {
+        guideForward();
+      }
       break;
 
-    case EV_APP_STOP:
-      stopMotors();
-      sendBLE("MOTOR:STOP");
+    case EV_APP_STATE_REQUEST:
+      sendCaneState();
       break;
 
-    case EV_APP_DISCONNECTED:
-      // 기존 onDisconnect()의 stopMotors()를 여기로 옮겼다.
-      stopMotors();
-      crossPulseRunning = false;
-      avoidPulseRunning = false;
-      break;
+    default: {
 
-    default:
-      handlePiEvent(ev.type);
+      uint32_t ageMs = (uint32_t)(micros() - ev.stampUs) / 1000;
+
+      if ((ev.type == EV_PI_CROSS_L || ev.type == EV_PI_CROSS_R) &&
+          ageMs > (uint32_t)CROSS_CMD_MAX_AGE_MS) {
+        logLine("[CROSS MOTOR] stale steer dropped (%lu ms old)", (unsigned long)ageMs);
+        break;
+      }
+
+      handlePiEvent(ev.type, ageMs);
       break;
+    }
   }
 }
 
-
-// =====================================================
-// motorTask
-//
-// 이벤트가 오면 처리하고, 안 와도 MOTOR_TICK_MS마다 깨어나서
-// 펄스 종료 / 회피 반복 / Pi 타임아웃 같은 시간 조건을 확인한다.
-// (기존 loop()에서 매번 부르던 update 함수들)
-// =====================================================
 
 void motorTask(void*) {
 
@@ -1153,13 +1430,18 @@ void motorTask(void*) {
 
   for (;;) {
 
-    if (xQueueReceive(motorQueue, &ev, pdMS_TO_TICKS(MOTOR_TICK_MS)) == pdTRUE) {
+    checkStopRequest();
+
+    if (xQueueReceive(motorQueue, &ev, jobWaitTicks()) == pdTRUE) {
+      checkStopRequest();
       handleMotorEvent(ev);
     }
 
-    if (obstacleTriggered) {
-      updateObstacleAvoidance();
-    }
+    stepJob();
+
+    updateObstacleAvoidance();
+
+    updateDeferredRed();
 
     updateCrosswalkSteering();
   }
@@ -1171,23 +1453,24 @@ void motorTask(void*) {
 
 
 // =====================================================
-// TFmini 읽기 (obstacleTask 전용)
+// TFmini
 //
-// 버퍼에 쌓인 프레임을 모두 읽고 "가장 최근" 거리를 돌려준다.
+// 버퍼에 쌓인 프레임을 모두 읽고 가장 최근의 유효한 거리를 돌려준다. (없으면 -1)
+// alive: checksum이 맞는 프레임을 하나라도 받았는지
 // =====================================================
 
-int readTFmini() {
+int readTFmini(bool& alive) {
 
   int latest = -1;
 
+  alive = false;
+
   while (TFSerial.available() >= 9) {
 
-    // 첫 번째 헤더
     if (TFSerial.read() != 0x59) {
       continue;
     }
 
-    // 두 번째 헤더 (아니면 버리지 않고 다음 바이트부터 다시 찾음)
     if (TFSerial.peek() != 0x59) {
       continue;
     }
@@ -1199,27 +1482,31 @@ int readTFmini() {
     buf[0] = 0x59;
     buf[1] = 0x59;
 
-    // available() >= 9 였으므로 나머지 7바이트는 이미 들어와 있음
     for (int i = 2; i < 9; i++) {
       buf[i] = TFSerial.read();
     }
 
-    // checksum
     uint16_t checksum = 0;
 
     for (int i = 0; i < 8; i++) {
       checksum += buf[i];
     }
 
-    checksum &= 0xFF;
-
-    if (checksum != buf[8]) {
+    if ((checksum & 0xFF) != buf[8]) {
       logLine("[TFmini] checksum error");
       continue;
     }
 
-    // 거리 cm
-    latest = buf[2] | (buf[3] << 8);
+    alive = true;
+
+    int distance = buf[2] | (buf[3] << 8);
+    int strength = buf[4] | (buf[5] << 8);
+
+    if (distance <= 0 || strength < TF_MIN_STRENGTH || strength == 65535) {
+      continue;
+    }
+
+    latest = distance;
   }
 
   return latest;
@@ -1227,25 +1514,44 @@ int readTFmini() {
 
 
 // =====================================================
-// obstacleTask (우선순위 최고)
+// obstacleTask
 //
-// 10ms마다 TFmini를 읽고 장애물 확정 / 해제를 판단한다.
-// 모터는 직접 건드리지 않는다.
-//
-// 확정 시:
-//  1) 장애물 이벤트를 motorQueue "맨 앞"에 넣고
-//  2) xTaskNotifyGive()로 motorTask의 진행 중 대기(길안내, 빨간불 역토크)를 끊는다.
-//
-// 이벤트를 못 넣으면(큐가 꽉 참) 상태를 바꾸지 않고 다음 주기에 다시 시도한다.
+// 정면 상태(센서 이상 / 장애물)가 바뀌면 한 묶음으로 motorTask 큐 맨 앞에 넣는다.
+// 큐가 꽉 차 있으면 기다리지 않고 다음 주기에 최신 상태로 다시 보낸다.
 // =====================================================
+
+bool sendFrontState(uint32_t& seq, bool lost, bool obstacle, uint32_t obstacleId, int distance) {
+
+  uint8_t flags = (lost ? FRONT_LOST : 0) | (obstacle ? FRONT_OBSTACLE : 0);
+
+  MotorEvent ev = { EV_FRONT_STATE, (float)distance, (uint32_t)micros(),
+                    seq + 1, obstacleId, flags };
+
+  if (xQueueSendToFront(motorQueue, &ev, 0) != pdTRUE) {
+    return false;
+  }
+
+  seq++;
+  return true;
+}
+
 
 void obstacleTask(void*) {
 
   int obstacleCount = 0;
+  int clearCount = 0;
   bool triggered = false;
+  uint32_t obstacleId = 0;
 
-  unsigned long lastDistancePrint = 0;
-  unsigned long lastDistanceSend = 0;
+  bool sensorLost = true;
+  bool dirty = false;
+  uint32_t seq = 0;
+  int lastDistance = -1;
+
+  unsigned long lastFrameAt = millis();
+  unsigned long lastValidAt = millis();
+  unsigned long lastLostNotice = 0;
+  unsigned long lastDistanceReport = 0;
 
   uint32_t lastRunUs = micros();
 
@@ -1253,7 +1559,6 @@ void obstacleTask(void*) {
 
   for (;;) {
 
-    // 실제 확인 주기 측정 (기존 loop와 비교용)
     uint32_t nowUs = micros();
     uint32_t period = nowUs - lastRunUs;
     lastRunUs = nowUs;
@@ -1262,77 +1567,110 @@ void obstacleTask(void*) {
       obstacleMaxPeriodUs = period;
     }
 
-    int distance = readTFmini();
+    bool alive = false;
+    int distance = readTFmini(alive);
+    unsigned long now = millis();
 
-    if (distance > 0) {
+    if (alive) {
+      lastFrameAt = now;
+    }
 
-      unsigned long now = millis();
+    if (distance <= 0) {
 
-      if (now - lastDistancePrint >= (unsigned long)REPORT_MS) {
+      if (now - lastValidAt > (unsigned long)OBSTACLE_GAP_RESET_MS) {
+        obstacleCount = 0;
+        clearCount = 0;
+      }
+
+      bool noFrames = now - lastFrameAt > (unsigned long)TF_STALE_MS;
+      bool noValid = now - lastValidAt > (unsigned long)TF_INVALID_LOST_MS;
+
+      if (noFrames || noValid) {
+
+        if (!sensorLost) {
+          sensorLost = true;
+          triggered = false;
+          dirty = true;
+          lastLostNotice = 0;
+
+          logLine(noFrames ? "[TFmini] no frames -> SENSOR LOST"
+                           : "[TFmini] no valid distance -> SENSOR LOST");
+        }
+
+        if (lastLostNotice == 0 ||
+            now - lastLostNotice >= (unsigned long)TF_LOST_REPEAT_MS) {
+          sendBLE("SENSOR:FRONT_LOST");
+          lastLostNotice = now;
+        }
+      }
+    }
+    else {
+
+      lastValidAt = now;
+      lastDistance = distance;
+
+      if (sensorLost) {
+        sensorLost = false;
+        dirty = true;
+        logLine("[TFmini] sensor OK");
+        sendBLE("SENSOR:FRONT_OK");
+      }
+
+      if (now - lastDistanceReport >= (unsigned long)REPORT_MS) {
         logLine("[TFmini] %d cm", distance);
-        lastDistancePrint = now;
+        sendReportf("DIST:%d", distance);
+        lastDistanceReport = now;
       }
 
-      // 앱에 거리 전송
-      if (now - lastDistanceSend >= (unsigned long)REPORT_MS) {
-        sendBLEf("DIST:%d", distance);
-        lastDistanceSend = now;
-      }
-
-      // TFmini 40cm 이하가 3회 연속 들어오면 장애물 확정
       if (distance <= OBSTACLE_DISTANCE) {
-
+        clearCount = 0;
         if (obstacleCount < OBSTACLE_CONFIRM_COUNT) {
           obstacleCount++;
-          logLine("[OBSTACLE COUNT] %d/%d", obstacleCount, OBSTACLE_CONFIRM_COUNT);
         }
       }
       else {
         obstacleCount = 0;
       }
 
-      if (obstacleCount >= OBSTACLE_CONFIRM_COUNT && !triggered) {
-
-        MotorEvent ev = { EV_OBSTACLE_CONFIRMED, (float)distance, (uint32_t)micros() };
-
-        if (xQueueSendToFront(motorQueue, &ev, pdMS_TO_TICKS(20)) == pdTRUE) {
-
-          triggered = true;
-
-          // 진행 중인 모터 동작 즉시 중단
-          xTaskNotifyGive(motorTaskHandle);
-
-          // Flutter에도 전달
-          sendBLEf("OBSTACLE:%d", distance);
-        }
-        else {
-          logLine("[OBSTACLE] motor queue full - retry");
-        }
+      if (!triggered && obstacleCount >= OBSTACLE_CONFIRM_COUNT) {
+        triggered = true;
+        obstacleId++;
+        clearCount = 0;
+        dirty = true;
+        sendBLEf("OBSTACLE:%d", distance);
       }
 
-      // 정면이 50cm 이상으로 다시 멀어지면 해제
-      if (distance >= RESET_DISTANCE && triggered) {
-
-        MotorEvent ev = { EV_OBSTACLE_CLEAR, (float)distance, (uint32_t)micros() };
-
-        if (xQueueSend(motorQueue, &ev, pdMS_TO_TICKS(20)) == pdTRUE) {
-          triggered = false;
-          obstacleCount = 0;
+      if (triggered) {
+        if (distance >= RESET_DISTANCE) {
+          if (++clearCount >= CLEAR_CONFIRM_COUNT) {
+            triggered = false;
+            obstacleCount = 0;
+            clearCount = 0;
+            dirty = true;
+          }
         }
         else {
-          logLine("[OBSTACLE] motor queue full - retry clear");
+          clearCount = 0;
         }
       }
     }
 
-    // 정확히 OBSTACLE_PERIOD_MS 주기로 실행 (처리 시간과 무관)
+    if (dirty) {
+      if (sendFrontState(seq, sensorLost, triggered, obstacleId, lastDistance)) {
+        dirty = false;
+      }
+      else {
+        logLine("[FRONT] motor queue full - retry next cycle");
+      }
+    }
+
     vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(OBSTACLE_PERIOD_MS));
   }
 }
 
 
 // =====================================================
-// VL53L1X 2개 초기화 (setup에서, 태스크 시작 전에 한 번)
+// VL53L1X
 // =====================================================
 
 void setupVL53L1X() {
@@ -1342,13 +1680,11 @@ void setupVL53L1X() {
   pinMode(VL_LEFT_XSHUT, OUTPUT);
   pinMode(VL_RIGHT_XSHUT, OUTPUT);
 
-  // 둘 다 끄기
   digitalWrite(VL_LEFT_XSHUT, LOW);
   digitalWrite(VL_RIGHT_XSHUT, LOW);
 
   delay(20);
 
-  // LEFT 먼저 켜고 0x30으로 주소 변경
   digitalWrite(VL_LEFT_XSHUT, HIGH);
   delay(20);
 
@@ -1366,13 +1702,10 @@ void setupVL53L1X() {
     logLine("[OK] VL53L1X LEFT  addr=0x30");
   }
   else {
-
     vlLeftOK = false;
-
     logLine("[ERROR] VL53L1X LEFT init failed");
   }
 
-  // RIGHT 켜고 기본주소 0x29에서 0x31로 변경
   digitalWrite(VL_RIGHT_XSHUT, HIGH);
   delay(20);
 
@@ -1390,26 +1723,21 @@ void setupVL53L1X() {
     logLine("[OK] VL53L1X RIGHT addr=0x31");
   }
   else {
-
     vlRightOK = false;
-
     logLine("[ERROR] VL53L1X RIGHT init failed");
   }
 }
 
 
-// =====================================================
-// sideSensorTask (I2C 전담)
-//
-// 기존 readVL53Left()/Right()는 read()가 새 값이 나올 때까지
-// 바쁘게 기다렸다(최대 수십 ms). 여기서는 dataReady()일 때만
-// read(false)로 바로 가져와서 다른 태스크에 CPU를 양보한다.
-//
-// SIDE_STALE_MS 동안 새 값이 없으면 -1 (기존 timeout과 같은 의미)
-// =====================================================
+// RangeValid / MinRangeClipped / NoWrapCheckFail만 쓰고, 나머지는 -1(막힘)
+bool isUsableRange(VL53L1X::RangeStatus status) {
+  return status == VL53L1X::RangeValid ||
+         status == VL53L1X::RangeValidMinRangeClipped ||
+         status == VL53L1X::RangeValidNoWrapCheckFail;
+}
 
 int updateSideSensor(VL53L1X& sensor, bool ok, unsigned long& lastUpdateAt,
-                     std::atomic<int>& out, const char* name) {
+                     std::atomic<int>& out, std::atomic<uint32_t>& outAt, const char* name) {
 
   if (!ok) {
     out = -1;
@@ -1419,9 +1747,22 @@ int updateSideSensor(VL53L1X& sensor, bool ok, unsigned long& lastUpdateAt,
   unsigned long now = millis();
 
   if (sensor.dataReady()) {
+
     uint16_t mm = sensor.read(false);
-    out = mm / 10;
+    VL53L1X::RangeStatus status = sensor.ranging_data.range_status;
+
     lastUpdateAt = now;
+
+    if (isUsableRange(status)) {
+      out = mm / 10;
+      outAt = (uint32_t)now;
+    }
+    else {
+      if (out != -1) {
+        logLine("[VL53 %s] invalid: %s", name, VL53L1X::rangeStatusToString(status));
+      }
+      out = -1;
+    }
   }
   else if (out != -1 && now - lastUpdateAt > (unsigned long)SIDE_STALE_MS) {
     logLine("[VL53 %s] timeout", name);
@@ -1441,15 +1782,14 @@ void sideSensorTask(void*) {
 
   for (;;) {
 
-    int leftDistance = updateSideSensor(vlLeft, vlLeftOK, leftUpdateAt, sideLeftCm, "LEFT");
-    int rightDistance = updateSideSensor(vlRight, vlRightOK, rightUpdateAt, sideRightCm, "RIGHT");
+    int leftDistance = updateSideSensor(vlLeft, vlLeftOK, leftUpdateAt, sideLeftCm, sideLeftAt, "LEFT");
+    int rightDistance = updateSideSensor(vlRight, vlRightOK, rightUpdateAt, sideRightCm, sideRightAt, "RIGHT");
 
-    // 300 ms마다 SIDE:왼쪽cm,오른쪽cm 전송 (읽기 실패 시 -1 -> 앱에서 -- cm)
     if (millis() - lastSideDistanceSend >= (unsigned long)REPORT_MS) {
 
       logLine("[VL53] LEFT=%d cm | RIGHT=%d cm", leftDistance, rightDistance);
 
-      sendBLEf("SIDE:%d,%d", leftDistance, rightDistance);
+      sendReportf("SIDE:%d,%d", leftDistance, rightDistance);
 
       lastSideDistanceSend = millis();
     }
@@ -1460,18 +1800,12 @@ void sideSensorTask(void*) {
 
 
 // =====================================================
-// Raspberry Pi 메시지 (piUartTask)
-//
-// Raspberry Pi에서 아래처럼 보내면 됨. (docs/PROTOCOL.md)
+// Raspberry Pi
 //
 // CROSSWALK:1 / CROSSWALK:0
 // LIGHT:RED / LIGHT:GREEN / LIGHT:GREEN_WAIT / LIGHT:NONE
 // CROSSING_START / CROSSING_END
 // CROSS_MOTOR:L / CROSS_MOTOR:R / CROSS_MOTOR:CENTER
-//
-// 각 메시지 뒤에는 반드시 \n
-//
-// 여기서는 문자열 -> 이벤트 변환만 하고, 상태 변경은 motorTask가 한다.
 // =====================================================
 
 struct PiCommand {
@@ -1495,7 +1829,67 @@ const PiCommand PI_COMMANDS[] = {
 };
 
 
-// 앞뒤 공백 제거 (기존 String::trim()과 같은 역할)
+// 큐가 꽉 찼을 때 상태 이벤트는 받은 시각과 함께 대기열에 두고 순서대로 다시 넣는다.
+// 방향 펄스(L/R)는 늦으면 의미가 없으므로 버린다.
+// 대기열도 넘치면 가장 오래된 것부터 버린다. (Pi가 상태를 주기적으로 다시 보내야 복구됨)
+MotorEvent piPending[PI_PENDING_LEN];
+int piPendingHead = 0;
+int piPendingCount = 0;
+
+void flushPiPending() {
+
+  while (piPendingCount > 0) {
+
+    if (xQueueSend(motorQueue, &piPending[piPendingHead], 0) != pdTRUE) {
+      return;
+    }
+
+    piPendingHead = (piPendingHead + 1) % PI_PENDING_LEN;
+    piPendingCount--;
+  }
+}
+
+void postPiEvent(EventType type) {
+
+  MotorEvent ev = { type, 0, (uint32_t)micros(), 0, 0, 0 };
+
+  bool pulse = type == EV_PI_CROSS_L || type == EV_PI_CROSS_R;
+
+  if (pulse) {
+    if (piPendingCount > 0 || xQueueSend(motorQueue, &ev, 0) != pdTRUE) {
+      logLine("[PI] queue busy, steer pulse dropped");
+    }
+    return;
+  }
+
+  if (piPendingCount > 0) {
+
+    // 같은 상태가 반복으로 오면 하나만 둔다. (처리 결과가 같음)
+    int last = (piPendingHead + piPendingCount - 1) % PI_PENDING_LEN;
+
+    if (piPending[last].type == type) {
+      flushPiPending();
+      return;
+    }
+  }
+
+  if (piPendingCount == PI_PENDING_LEN) {
+    logLine("[PI] pending full, oldest dropped (type=%d)", (int)piPending[piPendingHead].type);
+    piPendingHead = (piPendingHead + 1) % PI_PENDING_LEN;
+    piPendingCount--;
+  }
+
+  piPending[(piPendingHead + piPendingCount) % PI_PENDING_LEN] = ev;
+  piPendingCount++;
+
+  flushPiPending();
+
+  if (piPendingCount > 0) {
+    logLine("[PI] motor queue full, %d event(s) pending", piPendingCount);
+  }
+}
+
+
 char* trimInPlace(char* s) {
 
   while (*s == ' ' || *s == '\t') {
@@ -1524,43 +1918,48 @@ void handlePiLine(char* raw) {
 
   for (const PiCommand& cmd : PI_COMMANDS) {
     if (strcmp(message, cmd.text) == 0) {
-      postEvent(cmd.type);
+      postPiEvent(cmd.type);
       return;
     }
   }
 
-  // 신호등 인식 안 됨: 상태 변화 없이 앱에만 알림
   if (strcmp(message, "LIGHT:NONE") == 0) {
     sendBLE("LIGHT:NONE");
     return;
   }
 
-  // 그 외 Raspberry Pi 메시지는 앱에서도 확인할 수 있도록 그대로 전달
-  sendBLE(message);
+  sendReport(message);
 }
 
 
 void piUartTask(void*) {
 
-  char line[101];
+  char line[PI_LINE_MAX + 1];
   int len = 0;
+  bool overflow = false;
 
   for (;;) {
+
+    flushPiPending();
 
     while (PiSerial.available()) {
 
       char c = PiSerial.read();
 
       if (c == '\n') {
-        line[len] = '\0';
-        handlePiLine(line);
+        if (!overflow) {
+          line[len] = '\0';
+          handlePiLine(line);
+        }
         len = 0;
+        overflow = false;
       }
-      else if (c != '\r') {
+      else if (c != '\r' && !overflow) {
 
-        // 비정상 데이터 방지 (기존과 같이 100자 넘으면 버림)
-        if (len >= 100) {
-          len = 0;
+        // 너무 긴 줄은 다음 \n까지 통째로 버린다.
+        if (len >= PI_LINE_MAX) {
+          overflow = true;
+          logLine("[PI] line too long, dropped");
         }
         else {
           line[len++] = c;
@@ -1574,20 +1973,49 @@ void piUartTask(void*) {
 
 
 // =====================================================
-// bleTxTask
-//
-// sendBLE()가 넣은 메시지를 순서대로 notify한다.
-// notify는 BLE 스택 상태에 따라 오래 걸릴 수 있어서
-// 모터/센서 태스크가 직접 부르지 않게 따로 뺐다.
+// BLE
 // =====================================================
 
+bool takeBleMessage(BleMsg& msg) {
+
+  if (xQueueReceive(bleAlertQueue, &msg, 0) == pdTRUE) {
+    return true;
+  }
+
+  // 버려진 알림이 있었으면, 알림 큐가 빈 지금 최신 상태를 한 번 보낸다.
+  // 요청을 못 넣으면 표시를 되살려 다음에 다시 시도한다.
+  if (bleConnected && bleAlertDropped.exchange(false)) {
+    if (!postEvent(EV_APP_STATE_REQUEST)) {
+      bleAlertDropped.store(true);
+    }
+  }
+
+  if (xQueueReceive(bleReportQueue, &msg, 0) == pdTRUE) {
+    return true;
+  }
+
+  return xQueueReceive(bleAlertQueue, &msg, pdMS_TO_TICKS(10)) == pdTRUE;
+}
+
+
+// 알림 큐를 먼저 보낸다.
 void bleTxTask(void*) {
 
   BleMsg msg;
 
   for (;;) {
 
-    xQueueReceive(bleTxQueue, &msg, portMAX_DELAY);
+    uint32_t restartAt = advertiseRestartAt;
+
+    if (restartAt != 0 && (int32_t)(millis() - restartAt) >= 0) {
+      advertiseRestartAt = 0;
+      BLEDevice::startAdvertising();
+      logLine("BLE advertising restart");
+    }
+
+    if (!takeBleMessage(msg)) {
+      continue;
+    }
 
     if (!bleConnected || txCharacteristic == nullptr) {
       continue;
@@ -1601,13 +2029,25 @@ void bleTxTask(void*) {
 }
 
 
-// =====================================================
-// Flutter BLE 명령 처리 (BLE 스택 태스크에서 실행됨)
-//
-// B:90 / F:3.5 / L:45.0 / R:32.0 / S:0
-//
-// 여기서는 모터를 직접 돌리지 않고 이벤트만 보낸다.
-// =====================================================
+void logTask(void*) {
+
+  LogMsg msg;
+
+  for (;;) {
+
+    xQueueReceive(logQueue, &msg, portMAX_DELAY);
+
+    Serial.println(msg.text);
+
+    uint32_t dropped = droppedLogs.exchange(0);
+
+    if (dropped > 0) {
+      snprintf(msg.text, sizeof(msg.text), "[LOG] dropped lines: %lu", (unsigned long)dropped);
+      Serial.println(msg.text);
+    }
+  }
+}
+
 
 float parseAngle(const String& command) {
 
@@ -1621,6 +2061,7 @@ float parseAngle(const String& command) {
 }
 
 
+// B:90 / F:3.5 / L:45.0 / R:32.0 / S:0 / Q
 void handleFlutterCommand(String command) {
 
   command.trim();
@@ -1631,44 +2072,41 @@ void handleFlutterCommand(String command) {
 
   logLine("[BLE RX] %s", command.c_str());
 
-  // 목표 방위각 (예: B:135) - 로그용
   if (command.startsWith("B:")) {
-
     targetBearing = command.substring(2).toFloat();
-
     logLine("[NAV] Target bearing = %.2f", targetBearing);
-
     return;
   }
 
   if (command == "L" || command.startsWith("L:")) {
-    postEvent(EV_APP_LEFT, parseAngle(command));
+    postAppEvent(EV_APP_LEFT, parseAngle(command));
     return;
   }
 
   if (command == "R" || command.startsWith("R:")) {
-    postEvent(EV_APP_RIGHT, parseAngle(command));
+    postAppEvent(EV_APP_RIGHT, parseAngle(command));
     return;
   }
 
-  // 실제 모터 직진 X, 유도 모터만 정지
   if (command == "F" || command.startsWith("F:")) {
-    postEvent(EV_APP_FORWARD);
+    postAppEvent(EV_APP_FORWARD);
+    return;
+  }
+
+  // 정지 유지는 풀지 않는다.
+  if (command == "Q") {
+    postEvent(EV_APP_STATE_REQUEST);
     return;
   }
 
   if (command == "S" || command.startsWith("S:")) {
-    postEvent(EV_APP_STOP);
+    requestStop(false);
     return;
   }
 
   logLine("[BLE] Unknown command");
 }
 
-
-// =====================================================
-// BLE RX Callback
-// =====================================================
 
 class RxCallback : public BLECharacteristicCallbacks {
 
@@ -1681,47 +2119,29 @@ class RxCallback : public BLECharacteristicCallbacks {
 };
 
 
-// =====================================================
-// BLE 연결 상태
-// =====================================================
-
 class ServerCallback : public BLEServerCallbacks {
 
   void onConnect(BLEServer*) override {
 
     bleConnected = true;
 
-    logLine("");
     logLine("BLE CONNECTED");
   }
 
-  void onDisconnect(BLEServer* server) override {
+  // BLE 스택 콜백 안에서 기다리지 않도록 광고 재시작은 bleTxTask가 한다.
+  void onDisconnect(BLEServer*) override {
 
     bleConnected = false;
 
-    // 모터 정지도 motorTask에 맡긴다.
-    postEvent(EV_APP_DISCONNECTED);
+    requestStop(true);
 
-    logLine("");
+    uint32_t at = millis() + ADVERTISE_RESTART_DELAY_MS;
+    advertiseRestartAt = (at == 0) ? 1 : at;
+
     logLine("BLE DISCONNECTED");
-
-    delay(200);
-
-    server->getAdvertising()->start();
-
-    logLine("BLE advertising restart");
   }
 };
 
-
-// =====================================================
-// 디버그 모니터
-//
-// [MON] TFmini 최대 주기: 기존 loop였다면 역토크 중 1초 이상으로 늘어난다.
-//       RTOS 버전은 항상 약 10ms여야 정상.
-// stack free: 태스크별로 한 번이라도 남았던 최소 스택(byte).
-//       수백 byte 이하로 떨어지면 xTaskCreate의 스택 크기를 늘린다.
-// =====================================================
 
 #if DEBUG_MONITOR
 void monitorTask(void*) {
@@ -1731,76 +2151,120 @@ void monitorTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     logLine("[MON] TFmini max period=%lu us | stack free: obstacle=%u motor=%u pi=%u bleTx=%u side=%u",
-         (unsigned long)obstacleMaxPeriodUs.exchange(0),
-         (unsigned)uxTaskGetStackHighWaterMark(obstacleTaskHandle),
-         (unsigned)uxTaskGetStackHighWaterMark(motorTaskHandle),
-         (unsigned)uxTaskGetStackHighWaterMark(piTaskHandle),
-         (unsigned)uxTaskGetStackHighWaterMark(bleTxTaskHandle),
-         (unsigned)uxTaskGetStackHighWaterMark(sideTaskHandle));
+            (unsigned long)obstacleMaxPeriodUs.exchange(0),
+            (unsigned)uxTaskGetStackHighWaterMark(obstacleTaskHandle),
+            (unsigned)uxTaskGetStackHighWaterMark(motorTaskHandle),
+            (unsigned)uxTaskGetStackHighWaterMark(piTaskHandle),
+            (unsigned)uxTaskGetStackHighWaterMark(bleTxTaskHandle),
+            (unsigned)uxTaskGetStackHighWaterMark(sideTaskHandle));
   }
 }
 #endif
 
 
-// =====================================================
-// SETUP
-// =====================================================
+// 초기화 실패: 모터 핀을 LOW로 묶고 BLE를 켜지 않은 채 멈춘다.
+void haltOnInitError(const char* what) {
+
+  TaskHandle_t* handles[] = {
+    &obstacleTaskHandle, &motorTaskHandle, &piTaskHandle, &bleTxTaskHandle, &sideTaskHandle,
+    &logTaskHandle
+  };
+
+  for (TaskHandle_t* h : handles) {
+    if (*h != nullptr) {
+      vTaskDelete(*h);
+      *h = nullptr;
+    }
+  }
+
+  pinMode(M1_PWM, OUTPUT);
+  pinMode(M2_PWM, OUTPUT);
+  digitalWrite(M1_PWM, LOW);
+  digitalWrite(M2_PWM, LOW);
+
+  for (;;) {
+    Serial.print("[FATAL] init failed: ");
+    Serial.println(what);
+    delay(2000);
+  }
+}
+
+
+bool startTask(TaskFunction_t fn, const char* name, uint32_t stack,
+               UBaseType_t priority, TaskHandle_t* handle) {
+
+  if (xTaskCreatePinnedToCore(fn, name, stack, nullptr, priority, handle, APP_CORE) != pdPASS) {
+    if (handle != nullptr) {
+      *handle = nullptr;
+    }
+    return false;
+  }
+
+  return true;
+}
+
 
 void setup() {
-
-  // 로그 mutex와 큐는 다른 무엇보다 먼저 만든다.
-  // (BLE 콜백이 setup 도중에 불려도 안전하게)
-  logMutex = xSemaphoreCreateMutex();
-  motorQueue = xQueueCreate(MOTOR_QUEUE_LEN, sizeof(MotorEvent));
-  bleTxQueue = xQueueCreate(BLE_TX_QUEUE_LEN, sizeof(BleMsg));
 
   Serial.begin(115200);
 
   delay(500);
 
-  logLine("");
-  logLine("==============================");
-  logLine("SMART CANE START (FreeRTOS)");
-  logLine("==============================");
+  motorQueue = xQueueCreate(MOTOR_QUEUE_LEN, sizeof(MotorEvent));
+  bleAlertQueue = xQueueCreate(BLE_ALERT_QUEUE_LEN, sizeof(BleMsg));
+  bleReportQueue = xQueueCreate(BLE_REPORT_QUEUE_LEN, sizeof(BleMsg));
+  logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogMsg));
 
-  // =================================================
-  // Motor
-  // =================================================
+  if (motorQueue == nullptr || bleAlertQueue == nullptr ||
+      bleReportQueue == nullptr || logQueue == nullptr) {
+    haltOnInitError("queue (heap)");
+  }
+
+  if (!startTask(logTask, "log", 3072, 1, &logTaskHandle)) {
+    haltOnInitError("logTask");
+  }
+
+  logLine("SMART CANE START (FreeRTOS)");
+
   pinMode(M1_DIR, OUTPUT);
   pinMode(M2_DIR, OUTPUT);
 
   digitalWrite(M1_DIR, LOW);
   digitalWrite(M2_DIR, LOW);
 
-  ledcAttach(M1_PWM, 5000, 8);
-  ledcAttach(M2_PWM, 5000, 8);
+  if (!ledcAttach(M1_PWM, 5000, 8) || !ledcAttach(M2_PWM, 5000, 8)) {
+    haltOnInitError("ledcAttach (MDD10A PWM)");
+  }
 
   stopMotors();
 
   logLine("[OK] MDD10A");
 
-  // =================================================
-  // TFmini
-  // =================================================
   TFSerial.begin(115200, SERIAL_8N1, TF_RX, TF_TX);
 
   logLine("[OK] TFmini UART2");
 
-  // =================================================
-  // VL53L1X LEFT / RIGHT
-  // =================================================
+  // 실패해도 멈추지 않는다. 그쪽은 -1(막힘)로 처리된다.
   setupVL53L1X();
 
-  // =================================================
-  // Raspberry Pi UART
-  // =================================================
   PiSerial.begin(115200, SERIAL_8N1, PI_RX, PI_TX);
 
   logLine("[OK] Raspberry Pi UART1");
 
-  // =================================================
-  // BLE
-  // =================================================
+  if (!startTask(motorTask,      "motor",    4096, 4, &motorTaskHandle))    haltOnInitError("motorTask");
+  if (!startTask(obstacleTask,   "obstacle", 4096, 5, &obstacleTaskHandle)) haltOnInitError("obstacleTask");
+  if (!startTask(piUartTask,     "piUart",   4096, 3, &piTaskHandle))       haltOnInitError("piUartTask");
+  if (!startTask(bleTxTask,      "bleTx",    4096, 2, &bleTxTaskHandle))    haltOnInitError("bleTxTask");
+  if (!startTask(sideSensorTask, "side",     4096, 1, &sideTaskHandle))     haltOnInitError("sideSensorTask");
+
+#if DEBUG_MONITOR
+  if (!startTask(monitorTask,    "monitor",  3072, 1, nullptr)) {
+    logLine("[WARN] monitorTask not started");
+  }
+#endif
+
+  logLine("[OK] Tasks started");
+
   BLEDevice::init("SMART_CANE");
 
   BLEServer* server = BLEDevice::createServer();
@@ -1809,7 +2273,6 @@ void setup() {
 
   BLEService* service = server->createService(SERVICE_UUID);
 
-  // Flutter -> ESP32
   BLECharacteristic* rxCharacteristic =
       service->createCharacteristic(
         RX_UUID,
@@ -1818,7 +2281,6 @@ void setup() {
 
   rxCharacteristic->setCallbacks(new RxCallback());
 
-  // ESP32 -> Flutter
   txCharacteristic =
       service->createCharacteristic(
         TX_UUID,
@@ -1837,40 +2299,8 @@ void setup() {
   BLEDevice::startAdvertising();
 
   logLine("[OK] BLE SMART_CANE");
-
-  // =================================================
-  // Tasks
-  //
-  // motorTask를 obstacleTask보다 먼저 만든다.
-  // (obstacleTask가 motorTaskHandle로 알림을 보내기 때문)
-  // =================================================
-  xTaskCreatePinnedToCore(motorTask,      "motor",    4096, nullptr, 4, &motorTaskHandle,    APP_CORE);
-  xTaskCreatePinnedToCore(obstacleTask,   "obstacle", 4096, nullptr, 5, &obstacleTaskHandle, APP_CORE);
-  xTaskCreatePinnedToCore(piUartTask,     "piUart",   4096, nullptr, 3, &piTaskHandle,       APP_CORE);
-  xTaskCreatePinnedToCore(bleTxTask,      "bleTx",    4096, nullptr, 2, &bleTxTaskHandle,    APP_CORE);
-  xTaskCreatePinnedToCore(sideSensorTask, "side",     4096, nullptr, 1, &sideTaskHandle,     APP_CORE);
-
-#if DEBUG_MONITOR
-  xTaskCreatePinnedToCore(monitorTask,    "monitor",  3072, nullptr, 1, nullptr,             APP_CORE);
-#endif
-
-  logLine("[OK] Tasks started");
-
-  logLine("");
-  logLine("TFmini warning:");
-  logLine(" <= 100 cm : Flutter screen warning");
-  logLine(" <= 40 cm x3 : voice alert + reverse torque x3 + compare LEFT/RIGHT");
-  logLine(" then pull toward open side until front >= 50 cm");
-  logLine(" both side < 30 cm or still blocked : stop");
-  logLine("");
 }
 
-
-// =====================================================
-// LOOP
-//
-// 모든 일은 태스크가 한다. Arduino loopTask는 지운다.
-// =====================================================
 
 void loop() {
   vTaskDelete(nullptr);
