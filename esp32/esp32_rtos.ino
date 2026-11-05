@@ -7,6 +7,8 @@
 #include <atomic>
 #include <stdarg.h>
 #include <esp_arduino_version.h>
+enum JobKind :
+uint8_t;
 
 // ledcAttach(pin, freq, bits) / 핀 번호 ledcWrite()는 Arduino-ESP32 3.x API
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || ESP_ARDUINO_VERSION_MAJOR < 3
