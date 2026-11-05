@@ -124,9 +124,9 @@ bool obstacleTriggered = false;
 // 막혀 있어도 아무 동작을 하지 않았다.
 // =====================================================
 
-const int AVOID_PWM = 120;          // 장애물 회피: 강한 방향 유도
+const int AVOID_PWM = 100;          // 장애물 회피: 강한 방향 유도
 const int AVOID_PULSE_TIME = 400;   // 한 번 당기는 시간 (ms)
-const int AVOID_REPEAT_MS = 900;    // 당김 시작 간격 (ms)
+const int AVOID_REPEAT_MS = 900;   // 당김 시작 간격 (ms)
 const int AVOID_MAX_PULSES = 8;     // 이만큼 당겨도 정면이 막혀 있으면 "길 막힘"
 
 enum AvoidState {
@@ -174,7 +174,7 @@ const int BRAKE_PWM = 100;
 const int BRAKE_ON_TIME = 300;
 const int BRAKE_OFF_TIME = 200;
 
-const int BRAKE_COUNT = 3;
+const int BRAKE_COUNT = 2;
 
 // 빨간불로 바뀌면 역토크를 이 횟수만큼 줘서 "멈추세요"를 몸으로 알린다.
 // (장애물 경고 3회와 구분되도록 2회)
@@ -896,8 +896,7 @@ void handleObstacleAvoidance(int frontDistance) {
 // 장애물 회피 중 반복 (loop에서 obstacleTriggered일 때 매번 호출)
 //
 // 정면이 아직 막혀 있으면 AVOID_REPEAT_MS마다 다시 당긴다.
-// 당길 때마다 좌/우를 다시 확인해서, 피하던 쪽이 막히면
-// 반대쪽으로 바꾸고 둘 다 막히면 멈춘다.
+// 당기는 방향은 처음 감지 때 고른 쪽 그대로 유지한다.
 // AVOID_MAX_PULSES번 당겨도 정면이 안 트이면 "길 막힘"으로
 // 역토크를 한 번 더 주고 멈춘다.
 // =====================================================
@@ -930,13 +929,9 @@ void updateObstacleAvoidance() {
     return;
   }
 
-  AvoidState side = chooseAvoidSide(lastLeftDistance, lastRightDistance);
-
-  setAvoidState(side);
-
-  if (side == AVOID_LEFT || side == AVOID_RIGHT) {
-    startAvoidPulse(side);
-  }
+  // 방향은 처음 장애물을 감지했을 때 정한 쪽으로 고정한다.
+  // (도는 도중 좌/우 값으로 다시 고르지 않음)
+  startAvoidPulse(avoidState);
 }
 
 
