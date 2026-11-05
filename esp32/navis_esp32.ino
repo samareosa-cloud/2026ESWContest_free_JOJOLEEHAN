@@ -124,9 +124,9 @@ bool obstacleTriggered = false;
 // 막혀 있어도 아무 동작을 하지 않았다.
 // =====================================================
 
-const int AVOID_PWM = 100;          // 장애물 회피: 강한 방향 유도
-const int AVOID_PULSE_TIME = 400;   // 한 번 당기는 시간 (ms)
-const int AVOID_REPEAT_MS = 900;   // 당김 시작 간격 (ms)
+const int AVOID_PWM = 150;          // 장애물 회피: 강한 방향 유도
+const int AVOID_PULSE_TIME = 500;   // 한 번 당기는 시간 (ms)
+const int AVOID_REPEAT_MS = 1000;   // 당김 시작 간격 (ms)
 const int AVOID_MAX_PULSES = 8;     // 이만큼 당겨도 정면이 막혀 있으면 "길 막힘"
 
 enum AvoidState {
@@ -378,7 +378,8 @@ void guideRight(float angle) {
 
 void guideForward() {
 
-  if (obstacleTriggered) {
+  // 회피 당김이 남아 있으면 끝날 때까지 끊지 않는다.
+  if (obstacleTriggered || avoidPulseRunning) {
     return;
   }
 
@@ -1522,6 +1523,9 @@ void loop() {
   // =================================================
   // 장애물 회피 중이면 정면이 트일 때까지 계속 유도
   // =================================================
+  // 장애물이 풀린 뒤에도 남은 회피 당김은 시간이 되면 끈다.
+  updateAvoidPulse();
+
   if (obstacleTriggered) {
     updateObstacleAvoidance();
   }
@@ -1602,8 +1606,9 @@ void loop() {
       obstacleCount = 0;
 
       // 회피 유도 종료
-      stopMotors();
-      avoidPulseRunning = false;
+      // 당기던 중이면 바로 끊지 않고 AVOID_PULSE_TIME까지 마저 당긴다.
+      // (옆에 걸친 장애물은 조금만 돌아도 정면이 트여서 당김이 너무 짧았다)
+      // 남은 당김은 loop의 updateAvoidPulse()가 끝낸다.
       avoidPulseCount = 0;
       avoidState = AVOID_NONE;
 
