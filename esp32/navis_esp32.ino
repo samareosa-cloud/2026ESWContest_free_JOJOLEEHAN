@@ -118,16 +118,21 @@ bool obstacleTriggered = false;
 // =====================================================
 // 장애물 회피 유도
 //
-// 역토크 후 고른 방향(좌/우)으로, 정면이 트일 때
-// (TFmini RESET_DISTANCE 이상)까지 계속 당겨 준다.
-// 한 번만 당기고 끝내지 않고, 정면이 여전히
-// 막혀 있어도 아무 동작을 하지 않았다.
+// 역토크 후 고른 방향(좌/우)으로 당겨 준다.
+// 장애물 1건당 최대 AVOID_MAX_PULSES번만 당기고,
+// 그래도 정면이 막혀 있으면 더 당기지 않고 멈춰서 기다린다.
+// (뒤로 물러난 뒤에도 장애물이 계속 보이면 같은 방향 당김이
+//  계속 겹쳐서 제자리에서 빙빙 돌았다)
 // =====================================================
 
-const int AVOID_PWM = 150;          // 장애물 회피: 강한 방향 유도
-const int AVOID_PULSE_TIME = 500;   // 한 번 당기는 시간 (ms)
-const int AVOID_REPEAT_MS = 1000;   // 당김 시작 간격 (ms)
-const int AVOID_MAX_PULSES = 8;     // 이만큼 당겨도 정면이 막혀 있으면 "길 막힘"
+const int AVOID_PWM = 140;          // 장애물 회피: 강한 방향 유도
+const int AVOID_PULSE_TIME = 700;   // 한 번 당기는 시간 (ms)
+const int AVOID_REPEAT_MS = 1100;   // 당김 시작 간격 (ms)
+const int AVOID_MAX_PULSES = 2;     // 장애물 1건당 최대 당김 횟수
+
+// 장애물이 풀린 뒤 이 시간 동안은 새 장애물로 다시 잡지 않는다.
+// (돌다가 정면이 잠깐 트였다 다시 막히면 역토크+당김이 반복되는 것 방지)
+const int AVOID_COOLDOWN_MS = 1500;
 
 enum AvoidState {
   AVOID_NONE,
@@ -142,6 +147,7 @@ int avoidPulseCount = 0;
 unsigned long lastAvoidPulseAt = 0;
 unsigned long avoidPulseEndAt = 0;
 bool avoidPulseRunning = false;
+unsigned long obstacleClearedAt = 0;
 
 // loop에서 300ms마다 갱신되는 최근 좌/우 거리 (cm, 실패 시 -1)
 int lastLeftDistance = -1;
@@ -898,8 +904,8 @@ void handleObstacleAvoidance(int frontDistance) {
 //
 // 정면이 아직 막혀 있으면 AVOID_REPEAT_MS마다 다시 당긴다.
 // 당기는 방향은 처음 감지 때 고른 쪽 그대로 유지한다.
-// AVOID_MAX_PULSES번 당겨도 정면이 안 트이면 "길 막힘"으로
-// 역토크를 한 번 더 주고 멈춘다.
+// AVOID_MAX_PULSES번 당겨도 정면이 안 트이면 더 당기지 않고
+// "길 막힘"으로 멈춘 채 정면이 트이기를 기다린다.
 // =====================================================
 
 void updateObstacleAvoidance() {
@@ -920,12 +926,10 @@ void updateObstacleAvoidance() {
 
   if (avoidPulseCount >= AVOID_MAX_PULSES) {
 
-    Serial.println("[AVOID] front still blocked -> BLOCKED");
+    Serial.println("[AVOID] front still blocked -> stop pulling, wait");
 
+    // 더 당기지 않고 멈춘다. (BLOCKED가 되면 다시 당기지 않음)
     setAvoidState(AVOID_BLOCKED);
-
-    obstacleWarning();
-    flushTFmini();
 
     return;
   }
@@ -1520,12 +1524,12 @@ void loop() {
     readRaspberryPi();
   }
 
-  // =================================================
-  // 장애물 회피 중이면 정면이 트일 때까지 계속 유도
-  // =================================================
   // 장애물이 풀린 뒤에도 남은 회피 당김은 시간이 되면 끈다.
   updateAvoidPulse();
 
+  // =================================================
+  // 장애물 회피 중이면 정면이 트일 때까지 계속 유도
+  // =================================================
   if (obstacleTriggered) {
     updateObstacleAvoidance();
   }
@@ -1587,7 +1591,11 @@ void loop() {
       obstacleCount = 0;
     }
 
-    if (obstacleCount >= OBSTACLE_CONFIRM_COUNT && !obstacleTriggered) {
+    // 방금 풀린 장애물이면 AVOID_COOLDOWN_MS 동안은 다시 잡지 않는다.
+    bool inCooldown =
+        millis() - obstacleClearedAt < (unsigned long)AVOID_COOLDOWN_MS;
+
+    if (obstacleCount >= OBSTACLE_CONFIRM_COUNT && !obstacleTriggered && !inCooldown) {
 
       obstacleTriggered = true;
 
@@ -1604,6 +1612,7 @@ void loop() {
 
       obstacleTriggered = false;
       obstacleCount = 0;
+      obstacleClearedAt = millis();
 
       // 회피 유도 종료
       // 당기던 중이면 바로 끊지 않고 AVOID_PULSE_TIME까지 마저 당긴다.
