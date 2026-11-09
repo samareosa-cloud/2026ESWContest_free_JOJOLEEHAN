@@ -2,13 +2,6 @@
 
 스마트 지팡이의 **보행 경로 안내, 음성 목적지 입력, ESP32 BLE 통신 및 센서 상태 표시**를 담당하는 Flutter 앱입니다.
 
-앱은 두 버전이 있습니다.
-
-| 버전 | 위치 | 설명 |
-| --- | --- | --- |
-| 기본 UI | `lib/main.dart` | 기존 화면 (지도, 센서 값, 버튼) |
-| **Advanced UI** | `advancedui/main.dart` | 안전 로직 보강 + **시각장애인용 제스처 화면 / 보호자 화면** 분리 |
-
 ## System Architecture
 
 ```mermaid
